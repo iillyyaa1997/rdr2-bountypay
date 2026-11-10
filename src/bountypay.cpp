@@ -28,7 +28,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.0.4";
+constexpr const char* kVersion = "1.0.5";
 
 constexpr const char* kExpInit = "?nativeInit@@YAX_K@Z";
 constexpr const char* kExpPush = "?nativePush64@@YAX_K@Z";
@@ -52,6 +52,8 @@ constexpr uint64_t GET_PLAYER_WANTED_LEVEL = 0xABC532F9098BFD9DULL;
 constexpr uint64_t GET_BOUNTY = 0x54310AAB97B92816ULL;
 constexpr uint64_t CLEAR_BOUNTY = 0xC76F252371150D9AULL;
 constexpr uint64_t SET_WANTED_SCORE = 0xA80FF73F772ACF6AULL;
+constexpr uint64_t SET_LAW_REGION = 0x4752F68EB7F2D280ULL;
+constexpr uint64_t GET_HASH_KEY = 0xFD340785ADF8CFB7ULL;
 constexpr uint64_t SET_ENTITY_HEALTH = 0xAC2767ED8BDFAB15ULL;
 constexpr uint64_t ADD_BOUNTY = 0x0E3BDEED21BEB945ULL;
 constexpr uint64_t GET_WANTED_SCORE = 0xDD5FD601481F648BULL;
@@ -150,7 +152,9 @@ uint32_t StateHere() {
   g_push(Arg(1));
   ScrVec v;
   std::memcpy(&v, g_call(), sizeof(v));
-  return Call<uint32_t>(GET_MAP_ZONE_AT_COORDS, v.x, v.y, v.z, 0);  // 0 = STATE
+  const uint32_t zone = Call<uint32_t>(GET_MAP_ZONE_AT_COORDS, v.x, v.y, v.z, 0);  // 0 = STATE
+  if (!zone) Log("state zone not found at %.1f %.1f %.1f", v.x, v.y, v.z);
+  return zone;
 }
 
 std::string Usd(int cents) {
@@ -173,6 +177,49 @@ void Notify(const std::string& text) {
     int64_t pad[2];
   } b = {0, s, {0, 0}};
   Call<int>(UI_FEED_POST_HELP_TEXT, &a, &b, 1);
+}
+
+// Every state keeps its own bounty: GET/ADD/CLEAR_BOUNTY act on the law region selected last.
+struct StateRegion {
+  const char* region;
+  const char* state;
+  const char* label;
+};
+constexpr StateRegion kStates[] = {
+    {"LAW_REGION_SAINT_DENIS", "STATE_LEMOYNE", "Lemoyne"},
+    {"LAW_REGION_VALENTINE", "STATE_NEW_HANOVER", "New Hanover"},
+    {"LAW_REGION_WAPITI", "STATE_AMBARINO", "Ambarino"},
+    {"LAW_REGION_STRAWBERRY", "STATE_WEST_ELIZABETH", "West Elizabeth"},
+    {"LAW_REGION_TUMBLEWEED", "STATE_NEW_AUSTIN", "New Austin"},
+};
+constexpr int kStateCount = sizeof(kStates) / sizeof(kStates[0]);
+
+uint32_t Hash(const char* s) { return Call<uint32_t>(GET_HASH_KEY, s); }
+
+void SelectState(int p, int i) { Call(SET_LAW_REGION, p, Hash(kStates[i].region), Hash(kStates[i].state)); }
+
+int StateBounty(int p, int i) {
+  SelectState(p, i);
+  return Bounty(p);
+}
+
+// The state the player stands in, or the only state with a bounty, or -1
+int FindState(int p, uint32_t zone) {
+  int only = -1, withBounty = 0;
+  char line[160] = "";
+  int at = -1;
+  for (int i = 0; i < kStateCount; ++i) {
+    const int b = StateBounty(p, i);
+    snprintf(line + strlen(line), sizeof line - strlen(line), " %s=%d", kStates[i].label, b);
+    if (Hash(kStates[i].state) == zone) at = i;
+    if (b > 0) {
+      only = i;
+      ++withBounty;
+    }
+  }
+  Log("state bounties:%s (zone 0x%08X)", line, zone);
+  if (at >= 0) return at;
+  return withBounty == 1 ? only : -1;
 }
 
 // ------------------------------------------------------------ the logic
@@ -220,9 +267,11 @@ void SettleDeath(int p, const Snapshot& before) {
     return Log("death: respawned in another state (0x%08X -> 0x%08X), skipped", before.state, after.state);
   }
   if (after.cash > before.cash) return Log("death: cash grew across respawn (save loaded?), skipped");
-  // The bounty read after respawn is the one SET_BOUNTY changes; it also catches
-  // crimes reported while the player was dying.
-  const int bounty = after.bounty;
+  const int state = FindState(p, after.state);
+  if (state < 0) return Log("death: cannot tell which state's bounty to pay, skipped");
+  // Read after respawn: it also catches crimes reported while the player was dying.
+  const int bounty = StateBounty(p, state);
+  Log("death: paying the bounty of %s", kStates[state].label);
   if (bounty <= 0) return Log("death: no bounty in this state, skipped");
   int target = before.cash < bounty ? before.cash : bounty;
   int gameTook = before.cash - after.cash;
@@ -237,12 +286,12 @@ void SettleDeath(int p, const Snapshot& before) {
       g_dryRun);
   if (paid <= 0) return;
   if (!g_dryRun) {
-    // SET_BOUNTY read back fine yet left the bounty the player sees unchanged, so the cash is taken
-    // only after the bounty has moved.
+    // The cash is taken only after the bounty has moved
+    SelectState(p, state);
     Call(CLEAR_BOUNTY, p);
     if (left > 0) Call(ADD_BOUNTY, p, left);
     g_wait(kBountySettleMs);
-    const int reads = Bounty(p);
+    const int reads = StateBounty(p, state);
     if (reads != left) return Log("death: bounty should be %d but reads %d, no cash taken", left, reads);
     if (extra > 0) Call<int>(MONEY_DECREMENT_CASH_BALANCE, extra);
     g_watchBountyUntil = Now() + kBountyWatchMs;
@@ -323,10 +372,15 @@ void CheckTestCommand(int p) {
   const int read = fscanf(f, "%15s %d", word, &value);
   fclose(f);
   DeleteFileW(path.c_str());
-  if (read >= 2 && strcmp(word, "bounty") == 0) {
+  if (read >= 1 && strcmp(word, "states") == 0) {
+    FindState(p, StateHere());
+  } else if (read >= 2 && strcmp(word, "bounty") == 0) {
+    const int state = FindState(p, StateHere());
+    if (state < 0) return Log("test: state not found");
+    SelectState(p, state);
     Call(CLEAR_BOUNTY, p);
     if (value > 0) Call(ADD_BOUNTY, p, value);
-    Log("test: bounty set to %d, reads %d", value, Bounty(p));
+    Log("test: bounty of %s set to %d, reads %d", kStates[state].label, value, StateBounty(p, state));
   } else if (read >= 1 && strcmp(word, "die") == 0) {
     Call(SET_WANTED_SCORE, p, 500);
     g_wait(500);
