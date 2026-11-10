@@ -28,7 +28,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.0.3";
+constexpr const char* kVersion = "1.0.4";
 
 constexpr const char* kExpInit = "?nativeInit@@YAX_K@Z";
 constexpr const char* kExpPush = "?nativePush64@@YAX_K@Z";
@@ -51,6 +51,8 @@ constexpr uint64_t IS_PLAYER_BEING_ARRESTED = 0xC8183AE963C58374ULL;
 constexpr uint64_t GET_PLAYER_WANTED_LEVEL = 0xABC532F9098BFD9DULL;
 constexpr uint64_t GET_BOUNTY = 0x54310AAB97B92816ULL;
 constexpr uint64_t CLEAR_BOUNTY = 0xC76F252371150D9AULL;
+constexpr uint64_t SET_WANTED_SCORE = 0xA80FF73F772ACF6AULL;
+constexpr uint64_t SET_ENTITY_HEALTH = 0xAC2767ED8BDFAB15ULL;
 constexpr uint64_t ADD_BOUNTY = 0x0E3BDEED21BEB945ULL;
 constexpr uint64_t GET_WANTED_SCORE = 0xDD5FD601481F648BULL;
 constexpr uint64_t MONEY_GET_CASH_BALANCE = 0x0C02DABFA3B98176ULL;
@@ -310,6 +312,31 @@ void ApplyRefund() {
   }
 }
 
+// Test commands: BountyPay.test next to the .asi holds "bounty <cents>" or "die" and is consumed at once.
+void CheckTestCommand(int p) {
+  const std::wstring path = g_dir + L"\\BountyPay.test";
+  if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+  char word[16] = {};
+  int value = 0;
+  FILE* f = _wfopen(path.c_str(), L"r");
+  if (!f) return;
+  const int read = fscanf(f, "%15s %d", word, &value);
+  fclose(f);
+  DeleteFileW(path.c_str());
+  if (read >= 2 && strcmp(word, "bounty") == 0) {
+    Call(CLEAR_BOUNTY, p);
+    if (value > 0) Call(ADD_BOUNTY, p, value);
+    Log("test: bounty set to %d, reads %d", value, Bounty(p));
+  } else if (read >= 1 && strcmp(word, "die") == 0) {
+    Call(SET_WANTED_SCORE, p, 500);
+    g_wait(500);
+    Log("test: wanted score %d, cash %d, bounty %d, killing the player", Call<int>(GET_WANTED_SCORE, p), Cash(), Bounty(p));
+    Call(SET_ENTITY_HEALTH, Call<int>(PLAYER_PED_ID), 0, 0);
+  } else {
+    Log("test: unknown command in BountyPay.test");
+  }
+}
+
 void ScriptMain() {
   Log("script started (Enabled=%d DryRun=%d RequireWanted=%d Notify=%d)", g_enabled, g_dryRun, g_requireWanted,
       g_notify);
@@ -319,6 +346,7 @@ void ScriptMain() {
   bool wasDead = false, wasArrested = false, wasPlaying = true;
   const int startedAt = Now();
   bool refundChecked = false;
+  int lastTestCheck = 0;
   for (;;) {
     g_wait(0);
     if (!g_enabled) {
@@ -330,6 +358,10 @@ void ScriptMain() {
     bool arrested = Call<int>(IS_PLAYER_BEING_ARRESTED, p, 0) != 0 || Call<int>(IS_PLAYER_BEING_ARRESTED, p, 1) != 0;
     bool playing = Call<int>(IS_PLAYER_PLAYING, p) != 0;
     int now = Now();
+    if (phase == Phase::Watch && playing && !dead && !arrested && now - lastTestCheck >= 1000) {
+      lastTestCheck = now;
+      CheckTestCommand(p);
+    }
     if (g_watchBountyUntil && now < g_watchBountyUntil) {
       const int bounty = Bounty(p);
       if (bounty != g_watchedBounty) {
