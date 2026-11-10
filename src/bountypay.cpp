@@ -28,7 +28,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.1.0";
+constexpr const char* kVersion = "1.1.1";
 
 constexpr const char* kExpInit = "?nativeInit@@YAX_K@Z";
 constexpr const char* kExpPush = "?nativePush64@@YAX_K@Z";
@@ -74,6 +74,7 @@ FnPush g_push = nullptr;
 FnCall g_call = nullptr;
 FnScriptWait g_wait = nullptr;
 FnGetGlobalPtr g_globalPtr = nullptr;
+bool g_tableUsable = false;  // the table offset is verified for one game version only
 
 // Settings (BountyPay.ini, section [BountyPay]).
 bool g_enabled = true;
@@ -176,6 +177,37 @@ constexpr District kDistricts[] = {
     {0x7356B8ED, 5},  // guarma
 };
 
+// The script globals move between game builds, so the table is used on the verified build only
+constexpr DWORD kGameVersionMS = (1u << 16) | 0u;     // 1.0
+constexpr DWORD kGameVersionLS = (1491u << 16) | 50u;  // .1491.50
+
+bool GameVersionIsVerified() {
+  HMODULE ver = LoadLibraryW(L"version.dll");
+  if (!ver) return false;
+  using SizeFn = DWORD(WINAPI*)(LPCWSTR, LPDWORD);
+  using InfoFn = BOOL(WINAPI*)(LPCWSTR, DWORD, DWORD, LPVOID);
+  using QueryFn = BOOL(WINAPI*)(LPCVOID, LPCWSTR, LPVOID*, PUINT);
+  auto size = (SizeFn)GetProcAddress(ver, "GetFileVersionInfoSizeW");
+  auto info = (InfoFn)GetProcAddress(ver, "GetFileVersionInfoW");
+  auto query = (QueryFn)GetProcAddress(ver, "VerQueryValueW");
+  bool ok = false;
+  wchar_t exe[MAX_PATH];
+  if (size && info && query && GetModuleFileNameW(nullptr, exe, MAX_PATH)) {
+    DWORD ignored = 0;
+    const DWORD n = size(exe, &ignored);
+    std::string data(n, '\0');
+    VS_FIXEDFILEINFO* fixed = nullptr;
+    UINT len = 0;
+    if (n && info(exe, 0, n, &data[0]) && query(data.data(), L"\\", reinterpret_cast<LPVOID*>(&fixed), &len) && fixed) {
+      Log("game version %u.%u.%u.%u", HIWORD(fixed->dwFileVersionMS), LOWORD(fixed->dwFileVersionMS),
+          HIWORD(fixed->dwFileVersionLS), LOWORD(fixed->dwFileVersionLS));
+      ok = fixed->dwFileVersionMS == kGameVersionMS && fixed->dwFileVersionLS == kGameVersionLS;
+    }
+  }
+  FreeLibrary(ver);
+  return ok;
+}
+
 int* TableSlot(int state) { return reinterpret_cast<int*>(g_globalPtr(kBountyTable + kBountyStride * state)); }
 
 ScrVec PlayerCoords() {
@@ -272,12 +304,12 @@ void SettleDeath(int p, const Snapshot& before) {
   }
   if (after.cash > before.cash) return Log("death: cash grew across respawn (save loaded?), skipped");
   const int state = after.state;
-  if (state < 0 || !g_globalPtr) return Log("death: state unknown, skipped");
-  // Read after respawn: it also catches crimes reported while the player was dying.
-  const int bounty = *TableSlot(state);
-  const int native = Bounty(p);
-  Log("death: %s, table %d, native %d", kStateNames[state], bounty, native);
-  if (bounty != native) return Log("death: table and native bounty differ (another game version?), skipped");
+  if (!g_tableUsable) return Log("death: this game version is not verified, nothing taken");
+  if (state < 0) return Log("death: state unknown, skipped");
+  // Native first: it also catches crimes reported while the player was dying, the table can lag.
+  const int bounty = Bounty(p);
+  const int table = *TableSlot(state);
+  Log("death: %s, native %d, table %d", kStateNames[state], bounty, table);
   if (bounty <= 0) return Log("death: no bounty in this state, skipped");
   int target = before.cash < bounty ? before.cash : bounty;
   int gameTook = before.cash - after.cash;
@@ -381,7 +413,7 @@ void CheckTestCommand(int p) {
   DeleteFileW(path.c_str());
   if (read >= 1 && strcmp(word, "states") == 0) {
     char line[200] = "";
-    for (int i = 0; i < kStateCount && g_globalPtr; ++i) {
+    for (int i = 0; i < kStateCount && g_tableUsable; ++i) {
       snprintf(line + strlen(line), sizeof line - strlen(line), " %s=%d", kStateNames[i], *TableSlot(i));
     }
     Log("table:%s | native %d, here %d", line, Bounty(p), StateHere());
@@ -401,7 +433,7 @@ void CheckTestCommand(int p) {
     Log("test: cash now %d", Cash());
   } else if (read >= 2 && strcmp(word, "bounty") == 0) {
     const int state = StateHere();
-    if (state < 0 || !g_globalPtr) return Log("test: state unknown");
+    if (state < 0 || !g_tableUsable) return Log("test: state unknown or game version not verified");
     Call(SET_BOUNTY, p, value);
     *TableSlot(state) = value;
     Log("test: bounty of %s set to %d, table %d, native %d", kStateNames[state], value, *TableSlot(state), Bounty(p));
@@ -416,6 +448,8 @@ void CheckTestCommand(int p) {
 }
 
 void ScriptMain() {
+  g_tableUsable = g_globalPtr && GameVersionIsVerified();
+  Log("bounty table usable: %d", g_tableUsable);
   Log("script started (Enabled=%d DryRun=%d RequireWanted=%d Notify=%d)", g_enabled, g_dryRun, g_requireWanted,
       g_notify);
   Phase phase = Phase::Watch;
