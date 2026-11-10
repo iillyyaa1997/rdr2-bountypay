@@ -28,7 +28,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.0.2";
+constexpr const char* kVersion = "1.0.3";
 
 constexpr const char* kExpInit = "?nativeInit@@YAX_K@Z";
 constexpr const char* kExpPush = "?nativePush64@@YAX_K@Z";
@@ -50,7 +50,8 @@ constexpr uint64_t IS_PLAYER_PLAYING = 0xBFFB35986CAAE58CULL;
 constexpr uint64_t IS_PLAYER_BEING_ARRESTED = 0xC8183AE963C58374ULL;
 constexpr uint64_t GET_PLAYER_WANTED_LEVEL = 0xABC532F9098BFD9DULL;
 constexpr uint64_t GET_BOUNTY = 0x54310AAB97B92816ULL;
-constexpr uint64_t SET_BOUNTY = 0x093A9D1F72DF0D19ULL;
+constexpr uint64_t CLEAR_BOUNTY = 0xC76F252371150D9AULL;
+constexpr uint64_t ADD_BOUNTY = 0x0E3BDEED21BEB945ULL;
 constexpr uint64_t GET_WANTED_SCORE = 0xDD5FD601481F648BULL;
 constexpr uint64_t MONEY_GET_CASH_BALANCE = 0x0C02DABFA3B98176ULL;
 constexpr uint64_t MONEY_DECREMENT_CASH_BALANCE = 0x466BC8769CF26A7AULL;
@@ -80,6 +81,10 @@ int g_settleMs = 4000;
 int g_deathWindowMs = 90000;    // a longer gap means a save was loaded, not a respawn
 int g_arrestWindowMs = 240000;  // arrest, jail fade and release
 constexpr int kRefundDelayMs = 20000;  // let the save finish loading first
+constexpr int kBountySettleMs = 3000;  // before the new bounty is read back
+constexpr int kBountyWatchMs = 60000;  // how long later changes of the bounty are logged
+int g_watchBountyUntil = 0;
+int g_watchedBounty = 0;
 
 FILE* g_log = nullptr;
 std::wstring g_dir;
@@ -230,9 +235,17 @@ void SettleDeath(int p, const Snapshot& before) {
       g_dryRun);
   if (paid <= 0) return;
   if (!g_dryRun) {
+    // SET_BOUNTY read back fine yet left the bounty the player sees unchanged, so the cash is taken
+    // only after the bounty has moved.
+    Call(CLEAR_BOUNTY, p);
+    if (left > 0) Call(ADD_BOUNTY, p, left);
+    g_wait(kBountySettleMs);
+    const int reads = Bounty(p);
+    if (reads != left) return Log("death: bounty should be %d but reads %d, no cash taken", left, reads);
     if (extra > 0) Call<int>(MONEY_DECREMENT_CASH_BALANCE, extra);
-    Call(SET_BOUNTY, p, left);
-    Log("death: applied, cash now %d, bounty now %d", Cash(), Bounty(p));
+    g_watchBountyUntil = Now() + kBountyWatchMs;
+    g_watchedBounty = reads;
+    Log("death: applied, cash now %d, bounty now %d", Cash(), reads);
   }
   if (left == 0) {
     Notify("Награда погашена наличными: " + Usd(paid));
@@ -317,6 +330,15 @@ void ScriptMain() {
     bool arrested = Call<int>(IS_PLAYER_BEING_ARRESTED, p, 0) != 0 || Call<int>(IS_PLAYER_BEING_ARRESTED, p, 1) != 0;
     bool playing = Call<int>(IS_PLAYER_PLAYING, p) != 0;
     int now = Now();
+    if (g_watchBountyUntil && now < g_watchBountyUntil) {
+      const int bounty = Bounty(p);
+      if (bounty != g_watchedBounty) {
+        Log("bounty changed afterwards: %d -> %d", g_watchedBounty, bounty);
+        g_watchedBounty = bounty;
+      }
+    } else {
+      g_watchBountyUntil = 0;
+    }
     if (!refundChecked && playing && !dead && !arrested && now - startedAt > kRefundDelayMs) {
       refundChecked = true;
       ApplyRefund();
