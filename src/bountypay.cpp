@@ -28,7 +28,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.0.0";
+constexpr const char* kVersion = "1.0.2";
 
 constexpr const char* kExpInit = "?nativeInit@@YAX_K@Z";
 constexpr const char* kExpPush = "?nativePush64@@YAX_K@Z";
@@ -54,6 +54,8 @@ constexpr uint64_t SET_BOUNTY = 0x093A9D1F72DF0D19ULL;
 constexpr uint64_t GET_WANTED_SCORE = 0xDD5FD601481F648BULL;
 constexpr uint64_t MONEY_GET_CASH_BALANCE = 0x0C02DABFA3B98176ULL;
 constexpr uint64_t MONEY_DECREMENT_CASH_BALANCE = 0x466BC8769CF26A7AULL;
+constexpr uint64_t MONEY_INCREMENT_CASH_BALANCE = 0xBC3422DC91667621ULL;
+constexpr uint32_t ADD_REASON_DEFAULT = 0x2CD419DCU;  // joaat("ADD_REASON_DEFAULT")
 constexpr uint64_t GET_MISSION_FLAG = 0xB15CD1CF58771DE1ULL;
 constexpr uint64_t GET_GAME_TIMER = 0x4F67E8ECA7D3F667ULL;
 constexpr uint64_t GET_ENTITY_COORDS = 0xA86D5F069399F44DULL;
@@ -77,8 +79,10 @@ int g_notifyMs = 7000;
 int g_settleMs = 4000;
 int g_deathWindowMs = 90000;    // a longer gap means a save was loaded, not a respawn
 int g_arrestWindowMs = 240000;  // arrest, jail fade and release
+constexpr int kRefundDelayMs = 20000;  // let the save finish loading first
 
 FILE* g_log = nullptr;
+std::wstring g_dir;
 
 void Log(const char* fmt, ...) {
   if (!g_log) return;
@@ -267,6 +271,32 @@ void SettleArrest(int p, const Snapshot& before) {
   }
 }
 
+// One-shot return of money the add-on took by mistake: BountyPay.refund next to the .asi holds the
+// amount in cents. The file is claimed first, so a crash can never pay twice.
+void ApplyRefund() {
+  const std::wstring path = g_dir + L"\\BountyPay.refund";
+  const std::wstring claimed = path + L".claimed";
+  int cents = 0;
+  FILE* f = _wfopen(path.c_str(), L"r");
+  if (!f) return;
+  const int read = fscanf(f, "%d", &cents);
+  fclose(f);
+  if (read != 1 || cents <= 0) return Log("refund: bad amount in BountyPay.refund, ignored");
+  if (!MoveFileExW(path.c_str(), claimed.c_str(), MOVEFILE_REPLACE_EXISTING)) return Log("refund: cannot claim the file");
+  const int before = Cash();
+  Call<int>(MONEY_INCREMENT_CASH_BALANCE, cents, ADD_REASON_DEFAULT);
+  g_wait(500);
+  const int now = Cash();
+  Log("refund: %d cents, cash %d -> %d", cents, before, now);
+  if (now - before >= cents) {
+    DeleteFileW(claimed.c_str());
+    Notify("Возвращено " + Usd(cents) + ", списанные по ошибке");
+  } else {
+    MoveFileExW(claimed.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+    Log("refund: the balance did not grow, will try again next launch");
+  }
+}
+
 void ScriptMain() {
   Log("script started (Enabled=%d DryRun=%d RequireWanted=%d Notify=%d)", g_enabled, g_dryRun, g_requireWanted,
       g_notify);
@@ -274,6 +304,8 @@ void ScriptMain() {
   Snapshot last, pending;
   int settleFrom = 0, waitFrom = 0;
   bool wasDead = false, wasArrested = false, wasPlaying = true;
+  const int startedAt = Now();
+  bool refundChecked = false;
   for (;;) {
     g_wait(0);
     if (!g_enabled) {
@@ -285,6 +317,10 @@ void ScriptMain() {
     bool arrested = Call<int>(IS_PLAYER_BEING_ARRESTED, p, 0) != 0 || Call<int>(IS_PLAYER_BEING_ARRESTED, p, 1) != 0;
     bool playing = Call<int>(IS_PLAYER_PLAYING, p) != 0;
     int now = Now();
+    if (!refundChecked && playing && !dead && !arrested && now - startedAt > kRefundDelayMs) {
+      refundChecked = true;
+      ApplyRefund();
+    }
     if (dead != wasDead || arrested != wasArrested || playing != wasPlaying) {
       Log("flags: dead=%d arrested=%d playing=%d cash=%d bounty=%d", dead, arrested, playing, Cash(), Bounty(p));
       wasDead = dead;
@@ -383,6 +419,7 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
   GetModuleFileNameW(inst, path, MAX_PATH);
   std::wstring p = path;
   std::wstring dir = p.substr(0, p.find_last_of(L"\\/"));
+  g_dir = dir;
   g_log = _wfopen((dir + L"\\BountyPay.log").c_str(), L"a");
   Log("BountyPay %s loaded", kVersion);
   ReadIni(dir + L"\\BountyPay.ini");
