@@ -28,7 +28,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.0.5";
+constexpr const char* kVersion = "1.0.6";
 
 constexpr const char* kExpInit = "?nativeInit@@YAX_K@Z";
 constexpr const char* kExpPush = "?nativePush64@@YAX_K@Z";
@@ -153,7 +153,11 @@ uint32_t StateHere() {
   ScrVec v;
   std::memcpy(&v, g_call(), sizeof(v));
   const uint32_t zone = Call<uint32_t>(GET_MAP_ZONE_AT_COORDS, v.x, v.y, v.z, 0);  // 0 = STATE
-  if (!zone) Log("state zone not found at %.1f %.1f %.1f", v.x, v.y, v.z);
+  static bool warned = false;
+  if (!zone && !warned) {
+    warned = true;
+    Log("state zone not found at %.1f %.1f %.1f", v.x, v.y, v.z);
+  }
   return zone;
 }
 
@@ -374,6 +378,21 @@ void CheckTestCommand(int p) {
   DeleteFileW(path.c_str());
   if (read >= 1 && strcmp(word, "states") == 0) {
     FindState(p, StateHere());
+  } else if (read >= 1 && strcmp(word, "zones") == 0) {
+    int ped = Call<int>(PLAYER_PED_ID);
+    g_init(GET_ENTITY_COORDS);
+    g_push(Arg(ped));
+    g_push(Arg(1));
+    g_push(Arg(1));
+    ScrVec v;
+    std::memcpy(&v, g_call(), sizeof(v));
+    for (int type = -1; type <= 12; ++type) {
+      Log("zone type %d: 0x%08X", type, Call<uint32_t>(GET_MAP_ZONE_AT_COORDS, v.x, v.y, v.z, type));
+    }
+  } else if (read >= 2 && strcmp(word, "clear") == 0 && value >= 0 && value < kStateCount) {
+    SelectState(p, value);
+    Call(CLEAR_BOUNTY, p);
+    Log("test: cleared %s, reads %d", kStates[value].label, Bounty(p));
   } else if (read >= 2 && strcmp(word, "bounty") == 0) {
     const int state = FindState(p, StateHere());
     if (state < 0) return Log("test: state not found");
