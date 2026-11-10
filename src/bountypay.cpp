@@ -28,19 +28,21 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.0.6";
+constexpr const char* kVersion = "1.1.0";
 
 constexpr const char* kExpInit = "?nativeInit@@YAX_K@Z";
 constexpr const char* kExpPush = "?nativePush64@@YAX_K@Z";
 constexpr const char* kExpCall = "?nativeCall@@YAPEA_KXZ";
 constexpr const char* kExpScriptRegister = "?scriptRegister@@YAXPEAUHINSTANCE__@@P6AXXZ@Z";
 constexpr const char* kExpScriptWait = "?scriptWait@@YAXK@Z";
+constexpr const char* kExpGetGlobalPtr = "?getGlobalPtr@@YAPEA_KH@Z";
 
 using FnInit = void (*)(uint64_t);
 using FnPush = void (*)(uint64_t);
 using FnCall = uint64_t* (*)();
 using FnScriptRegister = void (*)(HMODULE, void (*)());
 using FnScriptWait = void (*)(DWORD);
+using FnGetGlobalPtr = uint64_t* (*)(int);
 
 // Native hashes (alloc8or/rdr3-nativedb-data).
 constexpr uint64_t PLAYER_ID = 0x217E9DC48139933DULL;
@@ -50,12 +52,9 @@ constexpr uint64_t IS_PLAYER_PLAYING = 0xBFFB35986CAAE58CULL;
 constexpr uint64_t IS_PLAYER_BEING_ARRESTED = 0xC8183AE963C58374ULL;
 constexpr uint64_t GET_PLAYER_WANTED_LEVEL = 0xABC532F9098BFD9DULL;
 constexpr uint64_t GET_BOUNTY = 0x54310AAB97B92816ULL;
-constexpr uint64_t CLEAR_BOUNTY = 0xC76F252371150D9AULL;
+constexpr uint64_t SET_BOUNTY = 0x093A9D1F72DF0D19ULL;
 constexpr uint64_t SET_WANTED_SCORE = 0xA80FF73F772ACF6AULL;
-constexpr uint64_t SET_LAW_REGION = 0x4752F68EB7F2D280ULL;
-constexpr uint64_t GET_HASH_KEY = 0xFD340785ADF8CFB7ULL;
 constexpr uint64_t SET_ENTITY_HEALTH = 0xAC2767ED8BDFAB15ULL;
-constexpr uint64_t ADD_BOUNTY = 0x0E3BDEED21BEB945ULL;
 constexpr uint64_t GET_WANTED_SCORE = 0xDD5FD601481F648BULL;
 constexpr uint64_t MONEY_GET_CASH_BALANCE = 0x0C02DABFA3B98176ULL;
 constexpr uint64_t MONEY_DECREMENT_CASH_BALANCE = 0x466BC8769CF26A7AULL;
@@ -74,6 +73,7 @@ FnInit g_init = nullptr;
 FnPush g_push = nullptr;
 FnCall g_call = nullptr;
 FnScriptWait g_wait = nullptr;
+FnGetGlobalPtr g_globalPtr = nullptr;
 
 // Settings (BountyPay.ini, section [BountyPay]).
 bool g_enabled = true;
@@ -144,7 +144,41 @@ int Cash() { return Call<int>(MONEY_GET_CASH_BALANCE); }
 int Bounty(int p) { return Call<int>(GET_BOUNTY, p); }
 int Now() { return Call<int>(GET_GAME_TIMER); }
 
-uint32_t StateHere() {
+// The bounty of every state lives in a script global (short_update: func_601, func_790):
+// Global_40.f_358[state], element size 12, the array's first slot holds its length. GET_BOUNTY and
+// SET_BOUNTY see only the state the player is in, and the map reads the table, so both must change.
+constexpr int kBountyTable = 40 + 358 + 1;
+constexpr int kBountyStride = 12;
+constexpr const char* kStateNames[] = {"Ambarino", "New Hanover", "Lemoyne", "West Elizabeth", "New Austin", "Guarma"};
+constexpr int kStateCount = sizeof(kStateNames) / sizeof(kStateNames[0]);
+constexpr int kZoneDistrict = 10;
+
+struct District {
+  uint32_t hash;  // joaat of the district name
+  int state;
+};
+constexpr District kDistricts[] = {
+    {0x89CBB335, 0},  // grizzlies_east
+    {0xA2398567, 0},  // grizzlies_west
+    {0x07D4FF5F, 1},  // heartlands
+    {0xF21D7665, 1},  // cumberland_forest
+    {0x7285FF5F, 1},  // roanoke_ridge
+    {0x28FD8B3D, 2},  // scarlett_meadows
+    {0xE3F913AC, 2},  // bluewater_marsh
+    {0xC920C87B, 2},  // bayou_nwa
+    {0xCFC5B2D1, 3},  // big_valley
+    {0x0C925868, 3},  // great_plains
+    {0x65BC9DB1, 3},  // tall_trees
+    {0x2BE0ECA6, 4},  // cholla_springs
+    {0x2E79F240, 4},  // rio_bravo
+    {0xEB388009, 4},  // gaptooth_ridge
+    {0xFCCF2B76, 4},  // hennigans_stead
+    {0x7356B8ED, 5},  // guarma
+};
+
+int* TableSlot(int state) { return reinterpret_cast<int*>(g_globalPtr(kBountyTable + kBountyStride * state)); }
+
+ScrVec PlayerCoords() {
   int ped = Call<int>(PLAYER_PED_ID);
   g_init(GET_ENTITY_COORDS);
   g_push(Arg(ped));
@@ -152,13 +186,22 @@ uint32_t StateHere() {
   g_push(Arg(1));
   ScrVec v;
   std::memcpy(&v, g_call(), sizeof(v));
-  const uint32_t zone = Call<uint32_t>(GET_MAP_ZONE_AT_COORDS, v.x, v.y, v.z, 0);  // 0 = STATE
-  static bool warned = false;
-  if (!zone && !warned) {
-    warned = true;
-    Log("state zone not found at %.1f %.1f %.1f", v.x, v.y, v.z);
+  return v;
+}
+
+// The state the player stands in, -1 if the district is unknown
+int StateHere() {
+  const ScrVec v = PlayerCoords();
+  const uint32_t district = Call<uint32_t>(GET_MAP_ZONE_AT_COORDS, v.x, v.y, v.z, kZoneDistrict);
+  for (const District& d : kDistricts) {
+    if (d.hash == district) return d.state;
   }
-  return zone;
+  static uint32_t warned = 0;
+  if (district != warned) {
+    warned = district;
+    Log("unknown district 0x%08X at %.1f %.1f %.1f", district, v.x, v.y, v.z);
+  }
+  return -1;
 }
 
 std::string Usd(int cents) {
@@ -183,49 +226,6 @@ void Notify(const std::string& text) {
   Call<int>(UI_FEED_POST_HELP_TEXT, &a, &b, 1);
 }
 
-// Every state keeps its own bounty: GET/ADD/CLEAR_BOUNTY act on the law region selected last.
-struct StateRegion {
-  const char* region;
-  const char* state;
-  const char* label;
-};
-constexpr StateRegion kStates[] = {
-    {"LAW_REGION_SAINT_DENIS", "STATE_LEMOYNE", "Lemoyne"},
-    {"LAW_REGION_VALENTINE", "STATE_NEW_HANOVER", "New Hanover"},
-    {"LAW_REGION_WAPITI", "STATE_AMBARINO", "Ambarino"},
-    {"LAW_REGION_STRAWBERRY", "STATE_WEST_ELIZABETH", "West Elizabeth"},
-    {"LAW_REGION_TUMBLEWEED", "STATE_NEW_AUSTIN", "New Austin"},
-};
-constexpr int kStateCount = sizeof(kStates) / sizeof(kStates[0]);
-
-uint32_t Hash(const char* s) { return Call<uint32_t>(GET_HASH_KEY, s); }
-
-void SelectState(int p, int i) { Call(SET_LAW_REGION, p, Hash(kStates[i].region), Hash(kStates[i].state)); }
-
-int StateBounty(int p, int i) {
-  SelectState(p, i);
-  return Bounty(p);
-}
-
-// The state the player stands in, or the only state with a bounty, or -1
-int FindState(int p, uint32_t zone) {
-  int only = -1, withBounty = 0;
-  char line[160] = "";
-  int at = -1;
-  for (int i = 0; i < kStateCount; ++i) {
-    const int b = StateBounty(p, i);
-    snprintf(line + strlen(line), sizeof line - strlen(line), " %s=%d", kStates[i].label, b);
-    if (Hash(kStates[i].state) == zone) at = i;
-    if (b > 0) {
-      only = i;
-      ++withBounty;
-    }
-  }
-  Log("state bounties:%s (zone 0x%08X)", line, zone);
-  if (at >= 0) return at;
-  return withBounty == 1 ? only : -1;
-}
-
 // ------------------------------------------------------------ the logic
 
 struct Snapshot {
@@ -236,7 +236,7 @@ struct Snapshot {
   int wantedScore = 0;
   int wantedLevel = 0;
   bool mission = false;
-  uint32_t state = 0;
+  int state = -1;
 };
 
 enum class Phase { Watch, WaitRespawn, WaitRelease };
@@ -255,7 +255,7 @@ Snapshot TakeSnapshot(int p) {
 }
 
 void LogSnap(const char* tag, const Snapshot& s) {
-  Log("%s: cash=%d bounty=%d wantedScore=%d wantedLevel=%d mission=%d state=0x%08X", tag, s.cash, s.bounty,
+  Log("%s: cash=%d bounty=%d wantedScore=%d wantedLevel=%d mission=%d state=%d", tag, s.cash, s.bounty,
       s.wantedScore, s.wantedLevel, s.mission, s.state);
 }
 
@@ -268,14 +268,16 @@ void SettleDeath(int p, const Snapshot& before) {
   if (before.mission) return Log("death: story mission, skipped");
   if (g_requireWanted && !Wanted(before)) return Log("death: not wanted at the moment of death, skipped");
   if (after.state != before.state) {
-    return Log("death: respawned in another state (0x%08X -> 0x%08X), skipped", before.state, after.state);
+    return Log("death: respawned in another state (%d -> %d), skipped", before.state, after.state);
   }
   if (after.cash > before.cash) return Log("death: cash grew across respawn (save loaded?), skipped");
-  const int state = FindState(p, after.state);
-  if (state < 0) return Log("death: cannot tell which state's bounty to pay, skipped");
+  const int state = after.state;
+  if (state < 0 || !g_globalPtr) return Log("death: state unknown, skipped");
   // Read after respawn: it also catches crimes reported while the player was dying.
-  const int bounty = StateBounty(p, state);
-  Log("death: paying the bounty of %s", kStates[state].label);
+  const int bounty = *TableSlot(state);
+  const int native = Bounty(p);
+  Log("death: %s, table %d, native %d", kStateNames[state], bounty, native);
+  if (bounty != native) return Log("death: table and native bounty differ (another game version?), skipped");
   if (bounty <= 0) return Log("death: no bounty in this state, skipped");
   int target = before.cash < bounty ? before.cash : bounty;
   int gameTook = before.cash - after.cash;
@@ -291,12 +293,13 @@ void SettleDeath(int p, const Snapshot& before) {
   if (paid <= 0) return;
   if (!g_dryRun) {
     // The cash is taken only after the bounty has moved
-    SelectState(p, state);
-    Call(CLEAR_BOUNTY, p);
-    if (left > 0) Call(ADD_BOUNTY, p, left);
+    Call(SET_BOUNTY, p, left);
+    *TableSlot(state) = left;
     g_wait(kBountySettleMs);
-    const int reads = StateBounty(p, state);
-    if (reads != left) return Log("death: bounty should be %d but reads %d, no cash taken", left, reads);
+    const int reads = *TableSlot(state);
+    if (reads != left || Bounty(p) != left) {
+      return Log("death: bounty should be %d but table reads %d and native %d, no cash taken", left, reads, Bounty(p));
+    }
     if (extra > 0) Call<int>(MONEY_DECREMENT_CASH_BALANCE, extra);
     g_watchBountyUntil = Now() + kBountyWatchMs;
     g_watchedBounty = reads;
@@ -377,29 +380,31 @@ void CheckTestCommand(int p) {
   fclose(f);
   DeleteFileW(path.c_str());
   if (read >= 1 && strcmp(word, "states") == 0) {
-    FindState(p, StateHere());
+    char line[200] = "";
+    for (int i = 0; i < kStateCount && g_globalPtr; ++i) {
+      snprintf(line + strlen(line), sizeof line - strlen(line), " %s=%d", kStateNames[i], *TableSlot(i));
+    }
+    Log("table:%s | native %d, here %d", line, Bounty(p), StateHere());
   } else if (read >= 1 && strcmp(word, "zones") == 0) {
-    int ped = Call<int>(PLAYER_PED_ID);
-    g_init(GET_ENTITY_COORDS);
-    g_push(Arg(ped));
-    g_push(Arg(1));
-    g_push(Arg(1));
-    ScrVec v;
-    std::memcpy(&v, g_call(), sizeof(v));
+    const ScrVec v = PlayerCoords();
     for (int type = -1; type <= 12; ++type) {
       Log("zone type %d: 0x%08X", type, Call<uint32_t>(GET_MAP_ZONE_AT_COORDS, v.x, v.y, v.z, type));
     }
-  } else if (read >= 2 && strcmp(word, "clear") == 0 && value >= 0 && value < kStateCount) {
-    SelectState(p, value);
-    Call(CLEAR_BOUNTY, p);
-    Log("test: cleared %s, reads %d", kStates[value].label, Bounty(p));
+  } else if (read >= 2 && strcmp(word, "scan") == 0) {
+    // finds where a known amount sits among the first globals
+    for (int g = 0; g < 4000 && g_globalPtr; ++g) {
+      if (static_cast<int>(*g_globalPtr(g)) == value) Log("global %d = %d", g, value);
+    }
+  } else if (read >= 2 && strcmp(word, "money") == 0) {
+    Call<int>(MONEY_INCREMENT_CASH_BALANCE, value, ADD_REASON_DEFAULT);
+    g_wait(300);
+    Log("test: cash now %d", Cash());
   } else if (read >= 2 && strcmp(word, "bounty") == 0) {
-    const int state = FindState(p, StateHere());
-    if (state < 0) return Log("test: state not found");
-    SelectState(p, state);
-    Call(CLEAR_BOUNTY, p);
-    if (value > 0) Call(ADD_BOUNTY, p, value);
-    Log("test: bounty of %s set to %d, reads %d", kStates[state].label, value, StateBounty(p, state));
+    const int state = StateHere();
+    if (state < 0 || !g_globalPtr) return Log("test: state unknown");
+    Call(SET_BOUNTY, p, value);
+    *TableSlot(state) = value;
+    Log("test: bounty of %s set to %d, table %d, native %d", kStateNames[state], value, *TableSlot(state), Bounty(p));
   } else if (read >= 1 && strcmp(word, "die") == 0) {
     Call(SET_WANTED_SCORE, p, 500);
     g_wait(500);
@@ -516,6 +521,7 @@ bool Register() {
   g_push = (FnPush)GetProcAddress(g_sh, kExpPush);
   g_call = (FnCall)GetProcAddress(g_sh, kExpCall);
   auto reg = (FnScriptRegister)GetProcAddress(g_sh, kExpScriptRegister);
+  g_globalPtr = (FnGetGlobalPtr)GetProcAddress(g_sh, kExpGetGlobalPtr);
   g_wait = (FnScriptWait)GetProcAddress(g_sh, kExpScriptWait);
   if (!g_init || !g_push || !g_call || !reg || !g_wait) {
     Log("ScriptHookRDR2 exports not found, BountyPay inactive");
