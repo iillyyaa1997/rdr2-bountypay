@@ -26,9 +26,11 @@
 #include <string>
 #include <type_traits>
 
+#include "cash_history.hpp"
+
 namespace {
 
-constexpr const char* kVersion = "1.0.0";
+constexpr const char* kVersion = "1.0.1";
 
 constexpr const char* kExpInit = "?nativeInit@@YAX_K@Z";
 constexpr const char* kExpPush = "?nativePush64@@YAX_K@Z";
@@ -272,6 +274,7 @@ void ScriptMain() {
       g_notify);
   Phase phase = Phase::Watch;
   Snapshot last, pending;
+  CashHistory cashHistory;
   int settleFrom = 0, waitFrom = 0;
   bool wasDead = false, wasArrested = false, wasPlaying = true;
   for (;;) {
@@ -295,8 +298,17 @@ void ScriptMain() {
       case Phase::Watch:
         if (playing && !dead && !arrested) {
           last = TakeSnapshot(p);
+          cashHistory.Add(now, last.cash);
         } else if (last.valid && now - last.at < 15000 && (dead || arrested)) {
           pending = last;
+          {
+            int carried = cashHistory.Highest(pending.cash);
+            if (carried != pending.cash) {
+              Log("cash fell just before the event: carried %d, last frame %d", carried, pending.cash);
+              pending.cash = carried;
+            }
+            cashHistory.Clear();
+          }
           phase = dead ? Phase::WaitRespawn : Phase::WaitRelease;
           waitFrom = now;
           settleFrom = 0;
