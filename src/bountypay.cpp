@@ -28,7 +28,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.1.1";
+constexpr const char* kVersion = "1.1.2";
 
 constexpr const char* kExpInit = "?nativeInit@@YAX_K@Z";
 constexpr const char* kExpPush = "?nativePush64@@YAX_K@Z";
@@ -154,28 +154,39 @@ constexpr const char* kStateNames[] = {"Ambarino", "New Hanover", "Lemoyne", "We
 constexpr int kStateCount = sizeof(kStateNames) / sizeof(kStateNames[0]);
 constexpr int kZoneDistrict = 10;
 
+// Jenkins one-at-a-time, the game's name hash (lower case)
+constexpr uint32_t Joaat(const char* s) {
+  uint32_t h = 0;
+  for (; *s; ++s) {
+    const char c = (*s >= 'A' && *s <= 'Z') ? static_cast<char>(*s - 'A' + 'a') : *s;
+    h += static_cast<uint8_t>(c);
+    h += h << 10;
+    h ^= h >> 6;
+  }
+  h += h << 3;
+  h ^= h >> 11;
+  h += h << 15;
+  return h;
+}
+
 struct District {
-  uint32_t hash;  // joaat of the district name
+  uint32_t hash;  // joaat of the district name, written without spaces or underscores
   int state;
 };
+// Seen in game: heartlands, grizzlieswest, scarlettmeadows, bayounwa, bigvalley, greatplains
 constexpr District kDistricts[] = {
-    {0x89CBB335, 0},  // grizzlies_east
-    {0xA2398567, 0},  // grizzlies_west
-    {0x07D4FF5F, 1},  // heartlands
-    {0xF21D7665, 1},  // cumberland_forest
-    {0x7285FF5F, 1},  // roanoke_ridge
-    {0x28FD8B3D, 2},  // scarlett_meadows
-    {0xE3F913AC, 2},  // bluewater_marsh
-    {0xC920C87B, 2},  // bayou_nwa
-    {0xCFC5B2D1, 3},  // big_valley
-    {0x0C925868, 3},  // great_plains
-    {0x65BC9DB1, 3},  // tall_trees
-    {0x2BE0ECA6, 4},  // cholla_springs
-    {0x2E79F240, 4},  // rio_bravo
-    {0xEB388009, 4},  // gaptooth_ridge
-    {0xFCCF2B76, 4},  // hennigans_stead
-    {0x7356B8ED, 5},  // guarma
+    {Joaat("grizzlieseast"), 0},  {Joaat("grizzlieswest"), 0},    {Joaat("heartlands"), 1},
+    {Joaat("cumberlandforest"), 1}, {Joaat("roanokeridge"), 1},   {Joaat("scarlettmeadows"), 2},
+    {Joaat("bluewatermarsh"), 2}, {Joaat("bayounwa"), 2},         {Joaat("bigvalley"), 3},
+    {Joaat("greatplains"), 3},    {Joaat("talltrees"), 3},        {Joaat("chollasprings"), 4},
+    {Joaat("riobravo"), 4},       {Joaat("gaptoothridge"), 4},    {Joaat("hennigansstead"), 4},
+    {Joaat("guarma"), 5},
 };
+static_assert(Joaat("heartlands") == 0x07D4FF5F, "joaat");
+static_assert(Joaat("scarlettmeadows") == 0xCC7C3314, "joaat");
+// Some spots (rivers, a few gaps) have no district: the last known state counts while the player
+// is still within this distance of where it was seen.
+constexpr float kLastStateRadius = 400.0f;
 
 // The script globals move between game builds, so the table is used on the verified build only
 constexpr DWORD kGameVersionMS = (1u << 16) | 0u;     // 1.0
@@ -221,19 +232,28 @@ ScrVec PlayerCoords() {
   return v;
 }
 
-// The state the player stands in, -1 if the district is unknown
+// The state the player stands in, -1 if neither the district nor a nearby last known state tells
 int StateHere() {
+  static int lastState = -1;
+  static ScrVec lastAt{};
   const ScrVec v = PlayerCoords();
   const uint32_t district = Call<uint32_t>(GET_MAP_ZONE_AT_COORDS, v.x, v.y, v.z, kZoneDistrict);
   for (const District& d : kDistricts) {
-    if (d.hash == district) return d.state;
+    if (d.hash == district) {
+      lastState = d.state;
+      lastAt = v;
+      return d.state;
+    }
   }
-  static uint32_t warned = 0;
+  const float dx = v.x - lastAt.x, dy = v.y - lastAt.y;
+  const bool inReach = lastState >= 0 && dx * dx + dy * dy <= kLastStateRadius * kLastStateRadius;
+  static uint32_t warned = 1;
   if (district != warned) {
     warned = district;
-    Log("unknown district 0x%08X at %.1f %.1f %.1f", district, v.x, v.y, v.z);
+    Log("unknown district 0x%08X at %.1f %.1f %.1f, %s", district, v.x, v.y, v.z,
+        inReach ? kStateNames[lastState] : "no state nearby");
   }
-  return -1;
+  return inReach ? lastState : -1;
 }
 
 std::string Usd(int cents) {
