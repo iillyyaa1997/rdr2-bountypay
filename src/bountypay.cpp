@@ -64,6 +64,12 @@ constexpr uint64_t GET_MISSION_FLAG = 0xB15CD1CF58771DE1ULL;
 constexpr uint64_t GET_GAME_TIMER = 0x4F67E8ECA7D3F667ULL;
 constexpr uint64_t GET_ENTITY_COORDS = 0xA86D5F069399F44DULL;
 constexpr uint64_t GET_MAP_ZONE_AT_COORDS = 0x43AD8FC02B429D33ULL;
+constexpr uint64_t GET_PED_SOURCE_OF_DEATH = 0x93C8B64DEB84728CULL;
+constexpr uint64_t IS_ENTITY_A_PED = 0xCF8176912DDA4EA5ULL;
+constexpr uint64_t IS_ENTITY_A_VEHICLE = 0xC3D96AF45FCCEC4CULL;
+constexpr uint64_t GET_DRIVER_OF_VEHICLE = 0x2963B5C1637E8A27ULL;
+constexpr uint64_t GET_ENTITY_MODEL = 0xDA76A9F39210D365ULL;
+constexpr uint64_t GET_PED_RELATIONSHIP_GROUP_HASH = 0x7DBDD04862D95F04ULL;
 constexpr uint64_t VAR_STRING = 0xFA925AC00EB830B9ULL;
 constexpr uint64_t UI_FEED_POST_HELP_TEXT = 0x049D5C615BD38BADULL;
 
@@ -184,6 +190,23 @@ constexpr District kDistricts[] = {
 };
 static_assert(Joaat("heartlands") == 0x07D4FF5F, "joaat");
 static_assert(Joaat("scarlettmeadows") == 0xCC7C3314, "joaat");
+// Who the law sends after a player with a bounty (dispatch.meta and wilderness/bountyhunters.meta:
+// the bounty hunter riders by bounty level, marshals, Pinkertons, their dogs) and the lawmen
+// themselves. Bounty hunters come only while the player is not wanted, so a death at their hands
+// counts as a law death even when the wanted level reads zero.
+constexpr uint32_t kLawModels[] = {
+    Joaat("g_m_m_bountyhunters_01"),      Joaat("s_m_m_sdcowpoke_01"),
+    Joaat("g_m_m_unilangstonboys_01"),    Joaat("s_m_m_marshallsrural_01"),
+    Joaat("s_m_m_pinlaw_01"),             Joaat("a_c_doghound_01"),
+    Joaat("s_m_m_dispatchlawrural_01"),   Joaat("s_m_m_dispatchleaderrural_01"),
+    Joaat("s_m_m_ambientlawrural_01"),    Joaat("s_m_m_dispatchpolice_01"),
+    Joaat("s_m_m_dispatchleaderpolice_01"), Joaat("s_m_m_ambientblwpolice_01"),
+    Joaat("s_m_m_ambientsdpolice_01"),    Joaat("s_m_m_valdeputy_01"),
+    Joaat("a_m_m_valdeputyresident_01"),  Joaat("a_m_m_rhddeputyresident_01"),
+    Joaat("a_m_m_strdeputyresident_01"),  Joaat("a_m_m_asbdeputyresident_01"),
+    Joaat("a_m_m_armdeputyresident_01"),
+};
+
 // Some spots (rivers, a few gaps) have no district: the last known state counts while the player
 // is still within this distance of where it was seen.
 constexpr float kLastStateRadius = 400.0f;
@@ -289,7 +312,28 @@ struct Snapshot {
   int wantedLevel = 0;
   bool mission = false;
   int state = -1;
+  uint32_t killerModel = 0;  // set when the death is detected
+  bool killedByLaw = false;
 };
+
+// The model of whoever killed the player (the driver, if it was a vehicle), 0 if nobody
+uint32_t KillerModel() {
+  const int ped = Call<int>(PLAYER_PED_ID);
+  int killer = Call<int>(GET_PED_SOURCE_OF_DEATH, ped);
+  if (killer && Call<int>(IS_ENTITY_A_VEHICLE, killer)) killer = Call<int>(GET_DRIVER_OF_VEHICLE, killer);
+  if (!killer || !Call<int>(IS_ENTITY_A_PED, killer)) return 0;
+  const uint32_t model = Call<uint32_t>(GET_ENTITY_MODEL, killer);
+  Log("killed by ped model 0x%08X, relationship group 0x%08X", model,
+      Call<uint32_t>(GET_PED_RELATIONSHIP_GROUP_HASH, killer));
+  return model;
+}
+
+bool IsLawModel(uint32_t model) {
+  for (uint32_t m : kLawModels) {
+    if (m == model) return true;
+  }
+  return false;
+}
 
 enum class Phase { Watch, WaitRespawn, WaitRelease };
 
@@ -318,7 +362,10 @@ void SettleDeath(int p, const Snapshot& before) {
   LogSnap("death before", before);
   LogSnap("death after ", after);
   if (before.mission) return Log("death: story mission, skipped");
-  if (g_requireWanted && !Wanted(before)) return Log("death: not wanted at the moment of death, skipped");
+  if (g_requireWanted && !Wanted(before) && !before.killedByLaw) {
+    return Log("death: not wanted and not killed by the law or bounty hunters, skipped");
+  }
+  if (!Wanted(before) && before.killedByLaw) Log("death: killed by the law or bounty hunters (model 0x%08X)", before.killerModel);
   if (after.state != before.state) {
     return Log("death: respawned in another state (%d -> %d), skipped", before.state, after.state);
   }
@@ -519,6 +566,10 @@ void ScriptMain() {
           last = TakeSnapshot(p);
         } else if (last.valid && now - last.at < 15000 && (dead || arrested)) {
           pending = last;
+          if (dead) {
+            pending.killerModel = KillerModel();
+            pending.killedByLaw = pending.killerModel && IsLawModel(pending.killerModel);
+          }
           phase = dead ? Phase::WaitRespawn : Phase::WaitRelease;
           waitFrom = now;
           settleFrom = 0;
