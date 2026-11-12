@@ -28,7 +28,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.1.2";
+constexpr const char* kVersion = "1.1.3";
 
 constexpr const char* kExpInit = "?nativeInit@@YAX_K@Z";
 constexpr const char* kExpPush = "?nativePush64@@YAX_K@Z";
@@ -70,6 +70,8 @@ constexpr uint64_t IS_ENTITY_A_VEHICLE = 0xC3D96AF45FCCEC4CULL;
 constexpr uint64_t GET_DRIVER_OF_VEHICLE = 0x2963B5C1637E8A27ULL;
 constexpr uint64_t GET_ENTITY_MODEL = 0xDA76A9F39210D365ULL;
 constexpr uint64_t GET_PED_RELATIONSHIP_GROUP_HASH = 0x7DBDD04862D95F04ULL;
+constexpr uint64_t MAP_IS_REGION_HIGHLIGHTED_WITH_STYLE = 0xE38450DBCBC70E3DULL;
+constexpr uint64_t MAP_DISABLE_REGION_BLIP = 0x6786D7AFAC3162B3ULL;
 constexpr uint64_t VAR_STRING = 0xFA925AC00EB830B9ULL;
 constexpr uint64_t UI_FEED_POST_HELP_TEXT = 0x049D5C615BD38BADULL;
 
@@ -80,6 +82,7 @@ FnPush g_push = nullptr;
 FnCall g_call = nullptr;
 FnScriptWait g_wait = nullptr;
 FnGetGlobalPtr g_globalPtr = nullptr;
+bool g_killerIsCop = false;  // the last killer was in the REL_COP relationship group
 bool g_tableUsable = false;  // the table offset is verified for one game version only
 
 // Settings (BountyPay.ini, section [BountyPay]).
@@ -244,6 +247,43 @@ bool GameVersionIsVerified() {
 
 int* TableSlot(int state) { return reinterpret_cast<int*>(g_globalPtr(kBountyTable + kBountyStride * state)); }
 
+// .f_5 of a state's entry: bit 4 = "this state has a bounty". The game sets it when the bounty reaches the
+// first wanted threshold, clears it when the bounty becomes 0 (short_update func_790 / func_784) and on
+// every load paints the state red on the map from this bit alone.
+constexpr int kStateFlagsField = 5;
+constexpr int kStateHasBounty = 4;
+int* StateFlags(int state) {
+  return reinterpret_cast<int*>(g_globalPtr(kBountyTable + kBountyStride * state + kStateFlagsField));
+}
+// The red state area on the map: _MAP_ENABLE_REGION_BLIP(joaat(name), BLIP_STYLE_WANTED_REGION)
+constexpr const char* kStateRegions[] = {"LBS_AMBARINO_BOUNTY", "LBS_NEW_HANOVER_BOUNTY", "LBS_LEMOYNE_BOUNTY",
+                                         "LBS_W_ELIZABETH_BOUNTY", "LBS_NEW_AUSTIN_BOUNTY", "LBS_GUARMA_BOUNTY"};
+constexpr uint32_t kStyleWantedRegion = 0xA7AA4808;  // BLIP_STYLE_WANTED_REGION
+constexpr uint32_t kStyleWantedRegionAlt = 0xB232154F;  // the second style func_784 checks
+
+// What func_790 does once a state's bounty is 0: drop the flag and the red area
+void ClearStateBountyMarks(int state, const char* why) {
+  int* flags = StateFlags(state);
+  if (*flags < 0 || *flags > 0xFFFF) {  // not a flag word: the layout differs from the decompiled one
+    return Log("%s: %s flags slot holds %d, left alone", why, kStateNames[state], *flags);
+  }
+  const bool flagged = (*flags & kStateHasBounty) != 0;
+  if (flagged) *flags &= ~kStateHasBounty;
+  const uint32_t region = Joaat(kStateRegions[state]);
+  const bool painted = Call<int>(MAP_IS_REGION_HIGHLIGHTED_WITH_STYLE, region, kStyleWantedRegionAlt) != 0 ||
+                       Call<int>(MAP_IS_REGION_HIGHLIGHTED_WITH_STYLE, region, kStyleWantedRegion) != 0;
+  if (painted) Call(MAP_DISABLE_REGION_BLIP, region);
+  if (flagged || painted) Log("%s: %s bounty marks cleared (flag %d, map area %d)", why, kStateNames[state], flagged, painted);
+}
+
+// A state whose bounty is 0 but still carries the flag (left behind by BountyPay up to 1.1.2) is
+// cleaned up the way the game would have done it
+void RepairStaleBountyMarks() {
+  for (int s = 0; s < kStateCount; ++s) {
+    if (*TableSlot(s) == 0) ClearStateBountyMarks(s, "repair");
+  }
+}
+
 ScrVec PlayerCoords() {
   int ped = Call<int>(PLAYER_PED_ID);
   g_init(GET_ENTITY_COORDS);
@@ -323,8 +363,9 @@ uint32_t KillerModel() {
   if (killer && Call<int>(IS_ENTITY_A_VEHICLE, killer)) killer = Call<int>(GET_DRIVER_OF_VEHICLE, killer);
   if (!killer || !Call<int>(IS_ENTITY_A_PED, killer)) return 0;
   const uint32_t model = Call<uint32_t>(GET_ENTITY_MODEL, killer);
-  Log("killed by ped model 0x%08X, relationship group 0x%08X", model,
-      Call<uint32_t>(GET_PED_RELATIONSHIP_GROUP_HASH, killer));
+  const uint32_t group = Call<uint32_t>(GET_PED_RELATIONSHIP_GROUP_HASH, killer);
+  Log("killed by ped model 0x%08X, relationship group 0x%08X", model, group);
+  if (group == Joaat("REL_COP")) g_killerIsCop = true;
   return model;
 }
 
@@ -400,6 +441,7 @@ void SettleDeath(int p, const Snapshot& before) {
       return Log("death: bounty should be %d but table reads %d and native %d, no cash taken", left, reads, Bounty(p));
     }
     if (extra > 0) Call<int>(MONEY_DECREMENT_CASH_BALANCE, extra);
+    if (left == 0) ClearStateBountyMarks(state, "death");
     g_watchBountyUntil = Now() + kBountyWatchMs;
     g_watchedBounty = reads;
     Log("death: applied, cash now %d, bounty now %d", Cash(), reads);
@@ -481,7 +523,8 @@ void CheckTestCommand(int p) {
   if (read >= 1 && strcmp(word, "states") == 0) {
     char line[200] = "";
     for (int i = 0; i < kStateCount && g_tableUsable; ++i) {
-      snprintf(line + strlen(line), sizeof line - strlen(line), " %s=%d", kStateNames[i], *TableSlot(i));
+      snprintf(line + strlen(line), sizeof line - strlen(line), " %s=%d/f%d", kStateNames[i], *TableSlot(i),
+               *StateFlags(i));
     }
     Log("table:%s | native %d, here %d", line, Bounty(p), StateHere());
   } else if (read >= 1 && strcmp(word, "zones") == 0) {
@@ -553,6 +596,7 @@ void ScriptMain() {
     if (!refundChecked && playing && !dead && !arrested && now - startedAt > kRefundDelayMs) {
       refundChecked = true;
       ApplyRefund();
+      if (g_tableUsable && !g_dryRun) RepairStaleBountyMarks();
     }
     if (dead != wasDead || arrested != wasArrested || playing != wasPlaying) {
       Log("flags: dead=%d arrested=%d playing=%d cash=%d bounty=%d", dead, arrested, playing, Cash(), Bounty(p));
@@ -567,8 +611,9 @@ void ScriptMain() {
         } else if (last.valid && now - last.at < 15000 && (dead || arrested)) {
           pending = last;
           if (dead) {
+            g_killerIsCop = false;
             pending.killerModel = KillerModel();
-            pending.killedByLaw = pending.killerModel && IsLawModel(pending.killerModel);
+            pending.killedByLaw = g_killerIsCop || (pending.killerModel && IsLawModel(pending.killerModel));
           }
           phase = dead ? Phase::WaitRespawn : Phase::WaitRelease;
           waitFrom = now;
