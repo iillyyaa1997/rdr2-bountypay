@@ -14,9 +14,10 @@
 //   Other states and the bank balance are never touched. Story missions skipped.
 //
 // Honor shield (operator decision 2026-11-15, D85 in the dog plan): a ped that attacks Arthur first - a mod's camp
-// guard, its dog - gets the game's ped decorator honor_override = 0, the one BountiesExpansion gives its own bounty
-// hunters, so killing and looting it costs no honor. Measured in game: without it -5 for the kill and -1 for the loot,
-// with it no change. Left alone: lawmen (REL_COP), law models while Arthur has a bounty or is wanted, peds Arthur hurt
+// guard, its dog - gets the game's ped decorator honor_override = 0 and (a human) the REL_CRIMINALS relationship group,
+// the two things BountiesExpansion gives its own bounty hunters, so killing and looting it costs no honor. Measured in
+// game 2026-11-15: no protection -5 for the kill and -1 for the loot; the decorator alone stops the kill penalty but
+// not the loot one; REL_CRIMINALS stops the loot one. Left alone: lawmen (REL_COP), law models while Arthur has a bounty or is wanted, peds Arthur hurt
 // before they fought him, peds that already carry the decorator (another mod decided), story missions.
 //
 // Natives are called through ScriptHookRDR2.dll exports resolved at runtime.
@@ -35,7 +36,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.2.0";
+constexpr const char* kVersion = "1.2.1";
 
 constexpr const char* kExpInit = "?nativeInit@@YAX_K@Z";
 constexpr const char* kExpPush = "?nativePush64@@YAX_K@Z";
@@ -89,6 +90,7 @@ constexpr uint64_t IS_PED_HUMAN = 0xB980061DA992779DULL;
 constexpr uint64_t HAS_ENTITY_BEEN_DAMAGED_BY_ENTITY = 0x7B6E7BEC1143AC86ULL;
 constexpr uint64_t DECOR_EXIST_ON = 0xD9D1CDBF3464DCDFULL;
 constexpr uint64_t DECOR_SET_INT = 0xE88F4D7F52A6090FULL;
+constexpr uint64_t SET_PED_RELATIONSHIP_GROUP_HASH = 0xC80A74AC829DDD92ULL;
 constexpr uint64_t STAT_ID_GET_INT = 0x767FBC2AC802EF3EULL;
 constexpr uint32_t STAT_HONOR_CURRENT = 0x89587B4EU;  // stat_values.lua (femga): HONOR_CURRENT
 
@@ -445,9 +447,11 @@ void HonorShield(int p, int now) {
       Log("honor: ped %d model 0x%08X group 0x%08X fights Arthur, left alone (%s)", ped, model, group, why);
       continue;
     }
+    const bool human = Call<int>(IS_PED_HUMAN, ped) != 0;
     Call<int>(DECOR_SET_INT, ped, "honor_override", 0);
-    Log("honor: ped %d model 0x%08X group 0x%08X (%s) attacked Arthur first: honor_override 0", ped, model, group,
-        Call<int>(IS_PED_HUMAN, ped) ? "human" : "animal");
+    if (human) Call(SET_PED_RELATIONSHIP_GROUP_HASH, ped, Joaat("REL_CRIMINALS"));
+    Log("honor: ped %d model 0x%08X group 0x%08X (%s) attacked Arthur first: honor_override 0%s", ped, model, group,
+        human ? "human" : "animal", human ? ", REL_CRIMINALS" : "");
   }
   if (g_honorLeft.size() > 512) g_honorLeft.clear();
 }
