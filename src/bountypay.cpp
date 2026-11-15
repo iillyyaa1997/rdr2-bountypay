@@ -100,6 +100,7 @@ constexpr uint64_t SET_PED_RELATIONSHIP_GROUP_HASH = 0xC80A74AC829DDD92ULL;
 constexpr uint64_t SET_PED_CONFIG_FLAG = 0x1913FE4CBF41C463ULL;
 constexpr int PCF_DisableHonorModifiers = 467;  // CPED_CONFIG_FLAGS (femga)
 constexpr uint64_t STAT_ID_GET_INT = 0x767FBC2AC802EF3EULL;
+constexpr uint64_t STAT_ID_SET_INT = 0xA4DDF5DF95E65EEEULL;
 constexpr uint32_t STAT_HONOR_CURRENT = 0x89587B4EU;  // stat_values.lua (femga): HONOR_CURRENT
 
 HMODULE g_self = nullptr;
@@ -625,10 +626,10 @@ void CheckTestCommand(int p) {
   const std::wstring path = g_dir + L"\\BountyPay.test";
   if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) return;
   char word[16] = {};
-  int value = 0;
+  int value = 0, value2 = 0;
   FILE* f = _wfopen(path.c_str(), L"r");
   if (!f) return;
-  const int read = fscanf(f, "%15s %d", word, &value);
+  const int read = fscanf(f, "%15s %d %d", word, &value, &value2);
   fclose(f);
   DeleteFileW(path.c_str());
   if (read >= 1 && strcmp(word, "states") == 0) {
@@ -658,6 +659,65 @@ void CheckTestCommand(int p) {
     Call(SET_BOUNTY, p, value);
     *TableSlot(state) = value;
     Log("test: bounty of %s set to %d, table %d, native %d", kStateNames[state], value, *TableSlot(state), Bounty(p));
+  } else if (read >= 1 && (strcmp(word, "hscan1") == 0 || strcmp(word, "hscan2") == 0)) {
+    // where the game keeps Arthur's honor: hscan1 <max> keeps the globals that equal it now (int or float), hscan2 (after
+    // the honor changed) keeps those that equal the new value; pages are checked with VirtualQuery before reading
+    static std::vector<int> cand;
+    const int honor = HonorNow();
+    const bool first = strcmp(word, "hscan1") == 0;
+    const int maxG = first ? (value > 0 ? value : 3000000) : 0;
+    auto readable = [](const void* ptr) {
+      static uintptr_t okPage = 0, badPage = 1;
+      const uintptr_t page = reinterpret_cast<uintptr_t>(ptr) & ~uintptr_t(0xFFF);
+      if (page == okPage) return true;
+      if (page == badPage) return false;
+      MEMORY_BASIC_INFORMATION mbi;
+      const bool ok = VirtualQuery(ptr, &mbi, sizeof mbi) && mbi.State == MEM_COMMIT &&
+                      (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) &&
+                      !(mbi.Protect & PAGE_GUARD);
+      (ok ? okPage : badPage) = page;
+      return ok;
+    };
+    auto match = [&](int g, int v) {
+      uint64_t* ptr = g_globalPtr(g);
+      if (!ptr || !readable(ptr)) return false;
+      const int iv = static_cast<int>(*ptr);
+      float fv;
+      memcpy(&fv, ptr, sizeof fv);
+      return iv == v || fv == static_cast<float>(v);
+    };
+    if (first) {
+      cand.clear();
+      for (int g = 0; g < maxG && g_globalPtr; ++g)
+        if (match(g, honor)) cand.push_back(g);
+    } else {
+      std::vector<int> keep;
+      for (int g : cand)
+        if (match(g, honor)) keep.push_back(g);
+      cand.swap(keep);
+    }
+    char line[400] = "";
+    for (size_t i = 0; i < cand.size() && i < 25; ++i) snprintf(line + strlen(line), sizeof line - strlen(line), " %d", cand[i]);
+    Log("test: %s honor %d -> %zu candidates:%s", word, honor, cand.size(), line);
+  } else if (read >= 3 && (strcmp(word, "gseti") == 0 || strcmp(word, "gsetf") == 0)) {
+    // gseti / gsetf <global> <value>: write it as an int / a float, then read the honor stat back after 1.5 s
+    uint64_t* ptr = g_globalPtr ? g_globalPtr(value) : nullptr;
+    if (!ptr) return Log("test: no global %d", value);
+    const int before = HonorNow();
+    if (word[4] == 'i') {
+      *reinterpret_cast<int*>(ptr) = value2;
+    } else {
+      const float fv = static_cast<float>(value2);
+      memcpy(ptr, &fv, sizeof fv);
+    }
+    g_wait(1500);
+    Log("test: %s global %d = %d, honor stat %d -> %d", word, value, value2, before, HonorNow());
+  } else if (read >= 1 && strcmp(word, "honorset") == 0) {
+    struct { alignas(8) uint32_t base; alignas(8) uint32_t perm; } id = {STAT_HONOR_CURRENT, 0};
+    const int before = HonorNow();
+    Call<int>(STAT_ID_SET_INT, &id, value, 1);
+    g_wait(1500);
+    Log("test: honorset %d: %d -> %d (after 1.5 s)", value, before, HonorNow());
   } else if (read >= 1 && strcmp(word, "honor") == 0) {
     Log("test: honor %d, shield %d", HonorNow(), g_honorShield);
   } else if (read >= 1 && strcmp(word, "die") == 0) {
