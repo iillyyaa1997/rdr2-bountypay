@@ -17,7 +17,8 @@
 // guard, its dog - gets the game's ped decorator honor_override = 0 and (a human) the REL_CRIMINALS relationship group,
 // the two things BountiesExpansion gives its own bounty hunters, so killing and looting it costs no honor. Measured in
 // game 2026-11-15: no protection -5 for the kill and -1 for the loot; the decorator alone stops the kill penalty but
-// not the loot one; REL_CRIMINALS stops the loot one. Left alone: lawmen (REL_COP), law models while Arthur has a bounty or is wanted, peds Arthur hurt
+// not the loot one; REL_CRIMINALS stops the loot one. An attacking dog cost -5 with both; an animal also gets
+// PCF_DisableHonorModifiers (467) - not verified yet. Left alone: lawmen (REL_COP), law models while Arthur has a bounty or is wanted, peds Arthur hurt
 // before they fought him, peds that already carry the decorator (another mod decided), story missions.
 //
 // Natives are called through ScriptHookRDR2.dll exports resolved at runtime.
@@ -36,7 +37,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.2.1";
+constexpr const char* kVersion = "1.2.2";
 
 constexpr const char* kExpInit = "?nativeInit@@YAX_K@Z";
 constexpr const char* kExpPush = "?nativePush64@@YAX_K@Z";
@@ -91,6 +92,8 @@ constexpr uint64_t HAS_ENTITY_BEEN_DAMAGED_BY_ENTITY = 0x7B6E7BEC1143AC86ULL;
 constexpr uint64_t DECOR_EXIST_ON = 0xD9D1CDBF3464DCDFULL;
 constexpr uint64_t DECOR_SET_INT = 0xE88F4D7F52A6090FULL;
 constexpr uint64_t SET_PED_RELATIONSHIP_GROUP_HASH = 0xC80A74AC829DDD92ULL;
+constexpr uint64_t SET_PED_CONFIG_FLAG = 0x1913FE4CBF41C463ULL;
+constexpr int PCF_DisableHonorModifiers = 467;  // CPED_CONFIG_FLAGS (femga)
 constexpr uint64_t STAT_ID_GET_INT = 0x767FBC2AC802EF3EULL;
 constexpr uint32_t STAT_HONOR_CURRENT = 0x89587B4EU;  // stat_values.lua (femga): HONOR_CURRENT
 
@@ -449,9 +452,13 @@ void HonorShield(int p, int now) {
     }
     const bool human = Call<int>(IS_PED_HUMAN, ped) != 0;
     Call<int>(DECOR_SET_INT, ped, "honor_override", 0);
-    if (human) Call(SET_PED_RELATIONSHIP_GROUP_HASH, ped, Joaat("REL_CRIMINALS"));
+    if (human) {
+      Call(SET_PED_RELATIONSHIP_GROUP_HASH, ped, Joaat("REL_CRIMINALS"));
+    } else {
+      Call(SET_PED_CONFIG_FLAG, ped, PCF_DisableHonorModifiers, 1);
+    }
     Log("honor: ped %d model 0x%08X group 0x%08X (%s) attacked Arthur first: honor_override 0%s", ped, model, group,
-        human ? "human" : "animal", human ? ", REL_CRIMINALS" : "");
+        human ? "human" : "animal", human ? ", REL_CRIMINALS" : ", PCF_DisableHonorModifiers");
   }
   if (g_honorLeft.size() > 512) g_honorLeft.clear();
 }
