@@ -123,7 +123,7 @@ int g_settleMs = 4000;
 int g_deathWindowMs = 90000;    // a longer gap means a save was loaded, not a respawn
 int g_arrestWindowMs = 240000;  // arrest, jail fade and release
 bool g_honorShield = true;
-bool g_honorPlayerFlag = true;
+bool g_honorPlayerFlag = false;
 std::map<int, int> g_shieldedAnimals;  // ped handle -> 1
 int g_animalFightUntil = 0;
 bool g_playerFlagOn = false;
@@ -779,7 +779,7 @@ void ReadIni(const std::wstring& ini) {
   g_deathWindowMs = get(L"DeathWindowMs", 90000);
   g_arrestWindowMs = get(L"ArrestWindowMs", 240000);
   g_honorShield = get(L"HonorShield", 1) != 0;
-  g_honorPlayerFlag = get(L"HonorShieldPlayerFlag", 1) != 0;
+  g_honorPlayerFlag = get(L"HonorShieldPlayerFlag", 0) != 0;   // measured 15.11 09:20: still -5 - off by default
 }
 
 bool Register() {
