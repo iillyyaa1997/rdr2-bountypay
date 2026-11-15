@@ -13,6 +13,12 @@
 //     gang broke you out of jail) nothing extra is taken.
 //   Other states and the bank balance are never touched. Story missions skipped.
 //
+// Honor shield (operator decision 2026-11-15, D85 in the dog plan): a ped that attacks Arthur first - a mod's camp
+// guard, its dog - gets the game's ped decorator honor_override = 0, the one BountiesExpansion gives its own bounty
+// hunters, so killing and looting it costs no honor. Measured in game: without it -5 for the kill and -1 for the loot,
+// with it no change. Left alone: lawmen (REL_COP), law models while Arthur has a bounty or is wanted, peds Arthur hurt
+// before they fought him, peds that already carry the decorator (another mod decided), story missions.
+//
 // Natives are called through ScriptHookRDR2.dll exports resolved at runtime.
 // Every event is written to BountyPay.log next to the .asi.
 
@@ -23,12 +29,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <string>
 #include <type_traits>
 
 namespace {
 
-constexpr const char* kVersion = "1.1.3";
+constexpr const char* kVersion = "1.2.0";
 
 constexpr const char* kExpInit = "?nativeInit@@YAX_K@Z";
 constexpr const char* kExpPush = "?nativePush64@@YAX_K@Z";
@@ -36,6 +43,7 @@ constexpr const char* kExpCall = "?nativeCall@@YAPEA_KXZ";
 constexpr const char* kExpScriptRegister = "?scriptRegister@@YAXPEAUHINSTANCE__@@P6AXXZ@Z";
 constexpr const char* kExpScriptWait = "?scriptWait@@YAXK@Z";
 constexpr const char* kExpGetGlobalPtr = "?getGlobalPtr@@YAPEA_KH@Z";
+constexpr const char* kExpWorldGetAllPeds = "?worldGetAllPeds@@YAHPEAHH@Z";
 
 using FnInit = void (*)(uint64_t);
 using FnPush = void (*)(uint64_t);
@@ -43,6 +51,7 @@ using FnCall = uint64_t* (*)();
 using FnScriptRegister = void (*)(HMODULE, void (*)());
 using FnScriptWait = void (*)(DWORD);
 using FnGetGlobalPtr = uint64_t* (*)(int);
+using FnWorldGetAllPeds = int (*)(int*, int);
 
 // Native hashes (alloc8or/rdr3-nativedb-data).
 constexpr uint64_t PLAYER_ID = 0x217E9DC48139933DULL;
@@ -74,6 +83,14 @@ constexpr uint64_t MAP_IS_REGION_HIGHLIGHTED_WITH_STYLE = 0xE38450DBCBC70E3DULL;
 constexpr uint64_t MAP_DISABLE_REGION_BLIP = 0x6786D7AFAC3162B3ULL;
 constexpr uint64_t VAR_STRING = 0xFA925AC00EB830B9ULL;
 constexpr uint64_t UI_FEED_POST_HELP_TEXT = 0x049D5C615BD38BADULL;
+constexpr uint64_t IS_ENTITY_DEAD = 0x7D5B1F88E7504BBAULL;
+constexpr uint64_t IS_PED_IN_COMBAT = 0x4859F1FC66A6278EULL;
+constexpr uint64_t IS_PED_HUMAN = 0xB980061DA992779DULL;
+constexpr uint64_t HAS_ENTITY_BEEN_DAMAGED_BY_ENTITY = 0x7B6E7BEC1143AC86ULL;
+constexpr uint64_t DECOR_EXIST_ON = 0xD9D1CDBF3464DCDFULL;
+constexpr uint64_t DECOR_SET_INT = 0xE88F4D7F52A6090FULL;
+constexpr uint64_t STAT_ID_GET_INT = 0x767FBC2AC802EF3EULL;
+constexpr uint32_t STAT_HONOR_CURRENT = 0x89587B4EU;  // stat_values.lua (femga): HONOR_CURRENT
 
 HMODULE g_self = nullptr;
 HMODULE g_sh = nullptr;
@@ -82,6 +99,7 @@ FnPush g_push = nullptr;
 FnCall g_call = nullptr;
 FnScriptWait g_wait = nullptr;
 FnGetGlobalPtr g_globalPtr = nullptr;
+FnWorldGetAllPeds g_allPeds = nullptr;
 bool g_killerIsCop = false;  // the last killer was in the REL_COP relationship group
 bool g_tableUsable = false;  // the table offset is verified for one game version only
 
@@ -94,6 +112,7 @@ int g_notifyMs = 7000;
 int g_settleMs = 4000;
 int g_deathWindowMs = 90000;    // a longer gap means a save was loaded, not a respawn
 int g_arrestWindowMs = 240000;  // arrest, jail fade and release
+bool g_honorShield = true;
 constexpr int kRefundDelayMs = 20000;  // let the save finish loading first
 constexpr int kBountySettleMs = 3000;  // before the new bounty is read back
 constexpr int kBountyWatchMs = 60000;  // how long later changes of the bounty are logged
@@ -376,6 +395,63 @@ bool IsLawModel(uint32_t model) {
   return false;
 }
 
+// Arthur's honor (stat HONOR_CURRENT, StatId {BaseId, PermutationId 0}); -9999 when it cannot be read
+int HonorNow() {
+  struct {
+    alignas(8) uint32_t base;
+    alignas(8) uint32_t perm;
+  } id = {STAT_HONOR_CURRENT, 0};
+  int v = -9999;
+  Call<int>(STAT_ID_GET_INT, &id, &v);
+  return v;
+}
+
+std::map<int, uint32_t> g_honorLeft;  // ped handle -> model of peds the shield decided to leave alone
+int g_honorScanAt = 0;
+int g_lastHonor = -9999;
+
+void HonorShield(int p, int now) {
+  if (!g_honorShield || !g_allPeds || now - g_honorScanAt < 500) return;
+  g_honorScanAt = now;
+  const int honor = HonorNow();
+  if (honor != g_lastHonor) {
+    if (g_lastHonor != -9999) Log("honor: %d -> %d", g_lastHonor, honor);
+    g_lastHonor = honor;
+  }
+  if (Call<int>(GET_MISSION_FLAG)) return;
+  const int me = Call<int>(PLAYER_PED_ID);
+  const bool lawAfterMe =
+      Bounty(p) > 0 || Call<int>(GET_PLAYER_WANTED_LEVEL, p) > 0 || Call<int>(GET_WANTED_SCORE, p) > 0;
+  static int peds[1024];
+  const int n = g_allPeds(peds, 1024);
+  for (int i = 0; i < n; ++i) {
+    const int ped = peds[i];
+    if (ped == me || Call<int>(IS_ENTITY_DEAD, ped) || !Call<int>(IS_PED_IN_COMBAT, ped, me)) continue;
+    const uint32_t model = Call<uint32_t>(GET_ENTITY_MODEL, ped);
+    auto left = g_honorLeft.find(ped);
+    if (left != g_honorLeft.end() && left->second == model) continue;
+    if (Call<int>(DECOR_EXIST_ON, ped, "honor_override")) continue;
+    const uint32_t group = Call<uint32_t>(GET_PED_RELATIONSHIP_GROUP_HASH, ped);
+    const char* why = nullptr;
+    if (group == Joaat("REL_COP")) {
+      why = "a lawman";
+    } else if (lawAfterMe && IsLawModel(model)) {
+      why = "law model while Arthur has a bounty";
+    } else if (Call<int>(HAS_ENTITY_BEEN_DAMAGED_BY_ENTITY, ped, me, 1, 1)) {
+      why = "Arthur hurt it first";
+    }
+    if (why) {
+      g_honorLeft[ped] = model;
+      Log("honor: ped %d model 0x%08X group 0x%08X fights Arthur, left alone (%s)", ped, model, group, why);
+      continue;
+    }
+    Call<int>(DECOR_SET_INT, ped, "honor_override", 0);
+    Log("honor: ped %d model 0x%08X group 0x%08X (%s) attacked Arthur first: honor_override 0", ped, model, group,
+        Call<int>(IS_PED_HUMAN, ped) ? "human" : "animal");
+  }
+  if (g_honorLeft.size() > 512) g_honorLeft.clear();
+}
+
 enum class Phase { Watch, WaitRespawn, WaitRelease };
 
 Snapshot TakeSnapshot(int p) {
@@ -547,6 +623,8 @@ void CheckTestCommand(int p) {
     Call(SET_BOUNTY, p, value);
     *TableSlot(state) = value;
     Log("test: bounty of %s set to %d, table %d, native %d", kStateNames[state], value, *TableSlot(state), Bounty(p));
+  } else if (read >= 1 && strcmp(word, "honor") == 0) {
+    Log("test: honor %d, shield %d", HonorNow(), g_honorShield);
   } else if (read >= 1 && strcmp(word, "die") == 0) {
     Call(SET_WANTED_SCORE, p, 500);
     g_wait(500);
@@ -560,8 +638,8 @@ void CheckTestCommand(int p) {
 void ScriptMain() {
   g_tableUsable = g_globalPtr && GameVersionIsVerified();
   Log("bounty table usable: %d", g_tableUsable);
-  Log("script started (Enabled=%d DryRun=%d RequireWanted=%d Notify=%d)", g_enabled, g_dryRun, g_requireWanted,
-      g_notify);
+  Log("script started (Enabled=%d DryRun=%d RequireWanted=%d Notify=%d HonorShield=%d)", g_enabled, g_dryRun,
+      g_requireWanted, g_notify, g_honorShield);
   Phase phase = Phase::Watch;
   Snapshot last, pending;
   int settleFrom = 0, waitFrom = 0;
@@ -584,6 +662,7 @@ void ScriptMain() {
       lastTestCheck = now;
       CheckTestCommand(p);
     }
+    if (phase == Phase::Watch && playing && !dead && !arrested) HonorShield(p, now);
     if (g_watchBountyUntil && now < g_watchBountyUntil) {
       const int bounty = Bounty(p);
       if (bounty != g_watchedBounty) {
@@ -664,6 +743,7 @@ void ReadIni(const std::wstring& ini) {
   g_settleMs = get(L"SettleMs", 4000);
   g_deathWindowMs = get(L"DeathWindowMs", 90000);
   g_arrestWindowMs = get(L"ArrestWindowMs", 240000);
+  g_honorShield = get(L"HonorShield", 1) != 0;
 }
 
 bool Register() {
@@ -673,6 +753,8 @@ bool Register() {
   auto reg = (FnScriptRegister)GetProcAddress(g_sh, kExpScriptRegister);
   g_globalPtr = (FnGetGlobalPtr)GetProcAddress(g_sh, kExpGetGlobalPtr);
   g_wait = (FnScriptWait)GetProcAddress(g_sh, kExpScriptWait);
+  g_allPeds = (FnWorldGetAllPeds)GetProcAddress(g_sh, kExpWorldGetAllPeds);
+  if (!g_allPeds) Log("worldGetAllPeds not exported, honor shield inactive");
   if (!g_init || !g_push || !g_call || !reg || !g_wait) {
     Log("ScriptHookRDR2 exports not found, BountyPay inactive");
     return false;
