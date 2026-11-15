@@ -19,7 +19,8 @@
 // game 2026-11-15: no protection -5 for the kill and -1 for the loot; the decorator alone stops the kill penalty but
 // not the loot one; REL_CRIMINALS set mid-fight does not stop it either; PCF_DisableHonorModifiers (467) does (window
 // 2026-11-15 05:19: decor + criminals + 467 = no change for the shot and the loot). An attacking dog still costs -5 with
-// decor + criminals + 467 (domestic animals count apart) - open. Left alone: lawmen (REL_COP), law models while Arthur has a bounty or is wanted, peds Arthur hurt
+// decor + criminals + 467 (domestic animals count apart); 1.2.4 also puts an attacking animal into REL_WILD_ANIMAL_PREDATOR
+// (a wolf costs no honor) - candidate, HonorShieldAnimalGroup=1, to verify. Left alone: lawmen (REL_COP), law models while Arthur has a bounty or is wanted, peds Arthur hurt
 // before they fought him, peds that already carry the decorator (another mod decided), story missions.
 //
 // Natives are called through ScriptHookRDR2.dll exports resolved at runtime.
@@ -38,7 +39,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.2.3";
+constexpr const char* kVersion = "1.2.4";
 
 constexpr const char* kExpInit = "?nativeInit@@YAX_K@Z";
 constexpr const char* kExpPush = "?nativePush64@@YAX_K@Z";
@@ -119,6 +120,7 @@ int g_settleMs = 4000;
 int g_deathWindowMs = 90000;    // a longer gap means a save was loaded, not a respawn
 int g_arrestWindowMs = 240000;  // arrest, jail fade and release
 bool g_honorShield = true;
+bool g_honorAnimalGroup = true;
 constexpr int kRefundDelayMs = 20000;  // let the save finish loading first
 constexpr int kBountySettleMs = 3000;  // before the new bounty is read back
 constexpr int kBountyWatchMs = 60000;  // how long later changes of the bounty are logged
@@ -454,9 +456,11 @@ void HonorShield(int p, int now) {
     const bool human = Call<int>(IS_PED_HUMAN, ped) != 0;
     Call<int>(DECOR_SET_INT, ped, "honor_override", 0);
     if (human) Call(SET_PED_RELATIONSHIP_GROUP_HASH, ped, Joaat("REL_CRIMINALS"));
+    else if (g_honorAnimalGroup) Call(SET_PED_RELATIONSHIP_GROUP_HASH, ped, Joaat("REL_WILD_ANIMAL_PREDATOR"));
     Call(SET_PED_CONFIG_FLAG, ped, PCF_DisableHonorModifiers, 1);
     Log("honor: ped %d model 0x%08X group 0x%08X (%s) attacked Arthur first: honor_override 0%s", ped, model, group,
-        human ? "human" : "animal", human ? ", REL_CRIMINALS, PCF_DisableHonorModifiers" : ", PCF_DisableHonorModifiers");
+        human ? "human" : "animal", human ? ", REL_CRIMINALS, PCF_DisableHonorModifiers"
+        : g_honorAnimalGroup ? ", REL_WILD_ANIMAL_PREDATOR, PCF_DisableHonorModifiers" : ", PCF_DisableHonorModifiers");
   }
   if (g_honorLeft.size() > 512) g_honorLeft.clear();
 }
@@ -753,6 +757,7 @@ void ReadIni(const std::wstring& ini) {
   g_deathWindowMs = get(L"DeathWindowMs", 90000);
   g_arrestWindowMs = get(L"ArrestWindowMs", 240000);
   g_honorShield = get(L"HonorShield", 1) != 0;
+  g_honorAnimalGroup = get(L"HonorShieldAnimalGroup", 1) != 0;
 }
 
 bool Register() {
