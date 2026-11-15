@@ -22,7 +22,10 @@
 // decor + criminals + 467 (domestic animals count apart); REL_WILD_ANIMAL_PREDATOR on top changed nothing either (window
 // 2026-11-15 06:09, -5 three times; the test dog never bit Arthur, so a dog that really attacks is still unmeasured) - open;
 // 1.2.5: while an attacking animal the shield marked is alive and fighting Arthur (and 4 s after), Arthur himself gets
-// PCF_DisableHonorModifiers - as Nexus mod 5153 does during law pursuit with hounds near (HonorShieldPlayerFlag=1). Left alone: lawmen (REL_COP), law models while Arthur has a bounty or is wanted, peds Arthur hurt
+// PCF_DisableHonorModifiers - as Nexus mod 5153 does during law pursuit with hounds near (HonorShieldPlayerFlag, off: still -5).
+// 1.2.6 (window 2026-11-15 09:57): the honor stat itself can be written (STAT_ID_SET_INT HONOR_CURRENT -8 -> -3 held 36 s
+// and the game's honor global 11170 followed), so when Arthur kills an attacking animal the shield marked, the honor it cost
+// is given back (HonorShieldAnimalRefund=1). Left alone: lawmen (REL_COP), law models while Arthur has a bounty or is wanted, peds Arthur hurt
 // before they fought him, peds that already carry the decorator (another mod decided), story missions.
 //
 // Natives are called through ScriptHookRDR2.dll exports resolved at runtime.
@@ -42,7 +45,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.2.5";
+constexpr const char* kVersion = "1.2.6";
 
 constexpr const char* kExpInit = "?nativeInit@@YAX_K@Z";
 constexpr const char* kExpPush = "?nativePush64@@YAX_K@Z";
@@ -92,6 +95,7 @@ constexpr uint64_t VAR_STRING = 0xFA925AC00EB830B9ULL;
 constexpr uint64_t UI_FEED_POST_HELP_TEXT = 0x049D5C615BD38BADULL;
 constexpr uint64_t IS_ENTITY_DEAD = 0x7D5B1F88E7504BBAULL;
 constexpr uint64_t DOES_ENTITY_EXIST = 0xD42BD6EB2E0F1677ULL;
+constexpr uint64_t GET_MOUNT = 0xE7E11B8DCBED1058ULL;
 constexpr uint64_t IS_PED_IN_COMBAT = 0x4859F1FC66A6278EULL;
 constexpr uint64_t IS_PED_HUMAN = 0xB980061DA992779DULL;
 constexpr uint64_t HAS_ENTITY_BEEN_DAMAGED_BY_ENTITY = 0x7B6E7BEC1143AC86ULL;
@@ -129,6 +133,9 @@ bool g_honorPlayerFlag = false;
 std::map<int, int> g_shieldedAnimals;  // ped handle -> 1
 int g_animalFightUntil = 0;
 bool g_playerFlagOn = false;
+bool g_animalRefund = true;
+std::map<int, int> g_animalHonorAlive;  // shielded animal -> Arthur's honor at the last scan it was alive
+int g_refundTo = -9999, g_refundUntil = 0;
 constexpr int kRefundDelayMs = 20000;  // let the save finish loading first
 constexpr int kBountySettleMs = 3000;  // before the new bounty is read back
 constexpr int kBountyWatchMs = 60000;  // how long later changes of the bounty are logged
@@ -472,6 +479,36 @@ void HonorShield(int p, int now) {
   if (g_honorLeft.size() > 512) g_honorLeft.clear();
   // an attacking animal (a camp's dog) still costs -5 with all of the above on the animal (windows 2026-11-15): the honor
   // modifiers are switched off on Arthur while such an animal fights him, and 4 s after it stops (dies)
+  // an attacking animal Arthur killed: the honor it cost is given back (within 4 s of its death)
+  if (g_animalRefund) {
+    for (auto it = g_shieldedAnimals.begin(); it != g_shieldedAnimals.end(); ++it) {
+      const int a = it->first;
+      if (!Call<int>(DOES_ENTITY_EXIST, a)) continue;
+      if (!Call<int>(IS_ENTITY_DEAD, a)) {
+        g_animalHonorAlive[a] = honor;
+      } else if (g_animalHonorAlive.count(a)) {
+        const int killer = Call<int>(GET_PED_SOURCE_OF_DEATH, a);
+        if (killer == me || killer == Call<int>(GET_MOUNT, me)) {
+          g_refundTo = g_animalHonorAlive[a];
+          g_refundUntil = now + 4000;
+          Log("honor: Arthur killed the attacking animal %d (honor before %d)", a, g_refundTo);
+        }
+        g_animalHonorAlive.erase(a);
+      }
+    }
+    if (g_refundTo != -9999) {
+      if (honor < g_refundTo) {
+        struct { alignas(8) uint32_t base; alignas(8) uint32_t perm; } id = {STAT_HONOR_CURRENT, 0};
+        Call<int>(STAT_ID_SET_INT, &id, g_refundTo, 1);
+        Log("honor: refund for the attacking animal %d -> %d", honor, g_refundTo);
+        g_lastHonor = g_refundTo;
+        g_refundTo = -9999;
+      } else if (now > g_refundUntil) {
+        g_refundTo = -9999;
+      }
+    }
+    if (g_animalHonorAlive.size() > 64) g_animalHonorAlive.clear();
+  }
   if (g_honorPlayerFlag) {
     for (auto it = g_shieldedAnimals.begin(); it != g_shieldedAnimals.end();) {
       const int a = it->first;
@@ -840,7 +877,8 @@ void ReadIni(const std::wstring& ini) {
   g_deathWindowMs = get(L"DeathWindowMs", 90000);
   g_arrestWindowMs = get(L"ArrestWindowMs", 240000);
   g_honorShield = get(L"HonorShield", 1) != 0;
-  g_honorPlayerFlag = get(L"HonorShieldPlayerFlag", 0) != 0;   // measured 15.11 09:20: still -5 - off by default
+  g_honorPlayerFlag = get(L"HonorShieldPlayerFlag", 0) != 0;
+  g_animalRefund = get(L"HonorShieldAnimalRefund", 1) != 0;   // measured 15.11 09:20: still -5 - off by default
 }
 
 bool Register() {
