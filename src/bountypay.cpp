@@ -36,6 +36,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <vector>
 #include <string>
 #include <type_traits>
 
