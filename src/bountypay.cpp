@@ -32,7 +32,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.3.0";
+constexpr const char* kVersion = "1.3.1";
 
 constexpr const char* kExpInit = "?nativeInit@@YAX_K@Z";
 constexpr const char* kExpPush = "?nativePush64@@YAX_K@Z";
@@ -88,6 +88,7 @@ constexpr uint64_t IS_PED_HUMAN = 0xB980061DA992779DULL;
 constexpr uint64_t HAS_ENTITY_BEEN_DAMAGED_BY_ENTITY = 0x7B6E7BEC1143AC86ULL;
 constexpr uint64_t SET_PED_RELATIONSHIP_GROUP_HASH = 0xC80A74AC829DDD92ULL;
 constexpr uint64_t SET_PED_CONFIG_FLAG = 0x1913FE4CBF41C463ULL;
+constexpr uint64_t GET_CURRENT_LANGUAGE = 0xDB917DA5C6835FCCULL;  // 7 = Russian
 constexpr uint32_t STAT_HONOR_CURRENT = 0x89587B4EU;  // stat_values.lua (femga): HONOR_CURRENT
 
 HMODULE g_self = nullptr;
@@ -107,6 +108,7 @@ bool g_dryRun = false;
 bool g_requireWanted = true;
 bool g_notify = true;
 int g_notifyMs = 7000;
+int g_language = 0;  // Language= in the ini: 0 auto (the game's), 1 English, 2 Russian
 int g_settleMs = 4000;
 int g_deathWindowMs = 90000;    // a longer gap means a save was loaded, not a respawn
 int g_arrestWindowMs = 240000;  // arrest, jail fade and release
@@ -341,6 +343,15 @@ std::string Usd(int cents) {
   return b;
 }
 
+// Notices follow the game's language (Language=auto) unless the ini picks one; before 1.3.1 they were Russian only
+bool Russian() {
+  if (g_language) return g_language == 2;
+  static int game = -1;
+  if (game < 0) game = Call<int>(GET_CURRENT_LANGUAGE);
+  return game == 7;
+}
+const char* Tr(const char* en, const char* ru) { return Russian() ? ru : en; }
+
 void Notify(const std::string& text) {
   Log("notice: %s", text.c_str());
   if (!g_notify) return;
@@ -463,9 +474,9 @@ void SettleDeath(int p, const Snapshot& before) {
     Log("death: applied, cash now %d, bounty now %d", Cash(), reads);
   }
   if (left == 0) {
-    Notify("Награда погашена наличными: " + Usd(paid));
+    Notify(Tr("Bounty paid off in cash: ", "Награда погашена наличными: ") + Usd(paid));
   } else {
-    Notify("В уплату награды ушло " + Usd(paid) + " наличными. Осталось: " + Usd(left));
+    Notify(Tr("Your cash paid ", "В уплату награды ушло ") + Usd(paid) + Tr(" of your bounty. Still owed: ", " наличными. Осталось: ") + Usd(left));
   }
 }
 
@@ -493,9 +504,9 @@ void SettleArrest(int p, const Snapshot& before) {
   }
   if (paid <= 0) return;
   if (before.cash >= before.bounty) {
-    Notify("Награда оплачена полностью: " + Usd(paid));
+    Notify(Tr("Bounty paid in full: ", "Награда оплачена полностью: ") + Usd(paid));
   } else {
-    Notify("Наличных не хватило: в уплату награды ушло " + Usd(paid) + " из " + Usd(before.bounty));
+    Notify(Tr("Not enough cash: paid ", "Наличных не хватило: в уплату награды ушло ") + Usd(paid) + Tr(" of a ", " из ") + Usd(before.bounty) + Tr(" bounty", ""));
   }
 }
 
@@ -518,7 +529,7 @@ void ApplyRefund() {
   Log("refund: %d cents, cash %d -> %d", cents, before, now);
   if (now - before >= cents) {
     DeleteFileW(claimed.c_str());
-    Notify("Возвращено " + Usd(cents) + ", списанные по ошибке");
+    Notify(Tr("Refunded ", "Возвращено ") + Usd(cents) + Tr(" taken by mistake", ", списанные по ошибке"));
   } else {
     MoveFileExW(claimed.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
     Log("refund: the balance did not grow, will try again next launch");
@@ -677,6 +688,9 @@ void ReadIni(const std::wstring& ini) {
   g_requireWanted = get(L"RequireWanted", 1) != 0;
   g_notify = get(L"Notify", 1) != 0;
   g_notifyMs = get(L"NotifyMs", 7000);
+  wchar_t lang[16] = {};
+  GetPrivateProfileStringW(L"BountyPay", L"Language", L"auto", lang, 16, ini.c_str());
+  g_language = _wcsicmp(lang, L"en") == 0 ? 1 : _wcsicmp(lang, L"ru") == 0 ? 2 : 0;
   g_settleMs = get(L"SettleMs", 4000);
   g_deathWindowMs = get(L"DeathWindowMs", 90000);
   g_arrestWindowMs = get(L"ArrestWindowMs", 240000);
