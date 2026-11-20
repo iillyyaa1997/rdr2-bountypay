@@ -536,7 +536,8 @@ void ApplyRefund() {
   }
 }
 
-// Test commands: BountyPay.test next to the .asi holds "bounty <cents>" or "die" and is consumed at once.
+#ifdef BOUNTYPAY_TEST
+// Test build only (TEST=1 ./build.sh): BountyPay.test next to the .asi holds a command and is consumed at once.
 void CheckTestCommand(int p) {
   const std::wstring path = g_dir + L"\\BountyPay.test";
   if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) return;
@@ -583,6 +584,7 @@ void CheckTestCommand(int p) {
     Log("test: unknown command in BountyPay.test");
   }
 }
+#endif
 
 void ScriptMain() {
   g_tableUsable = g_globalPtr && GameVersionIsVerified();
@@ -595,7 +597,9 @@ void ScriptMain() {
   bool wasDead = false, wasArrested = false, wasPlaying = true;
   const int startedAt = Now();
   bool refundChecked = false;
+#ifdef BOUNTYPAY_TEST
   int lastTestCheck = 0;
+#endif
   for (;;) {
     g_wait(0);
     if (!g_enabled) {
@@ -607,10 +611,12 @@ void ScriptMain() {
     bool arrested = Call<int>(IS_PLAYER_BEING_ARRESTED, p, 0) != 0 || Call<int>(IS_PLAYER_BEING_ARRESTED, p, 1) != 0;
     bool playing = Call<int>(IS_PLAYER_PLAYING, p) != 0;
     int now = Now();
+#ifdef BOUNTYPAY_TEST
     if (phase == Phase::Watch && playing && !dead && !arrested && now - lastTestCheck >= 1000) {
       lastTestCheck = now;
       CheckTestCommand(p);
     }
+#endif
     if (g_watchBountyUntil && now < g_watchBountyUntil) {
       const int bounty = Bounty(p);
       if (bounty != g_watchedBounty) {
