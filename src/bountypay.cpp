@@ -80,6 +80,9 @@ constexpr uint64_t MAP_IS_REGION_HIGHLIGHTED_WITH_STYLE = 0xE38450DBCBC70E3DULL;
 constexpr uint64_t MAP_DISABLE_REGION_BLIP = 0x6786D7AFAC3162B3ULL;
 constexpr uint64_t VAR_STRING = 0xFA925AC00EB830B9ULL;
 constexpr uint64_t UI_FEED_POST_HELP_TEXT = 0x049D5C615BD38BADULL;
+constexpr uint64_t IS_SCREEN_FADED_IN = 0x37F9A426FBCF4AF2ULL;
+constexpr uint64_t IS_PLAYER_CONTROL_ON = 0x7964097FCE4C244BULL;
+constexpr uint64_t IS_HUD_HIDDEN = 0x71B72B478F8189DCULL;
 constexpr uint64_t IS_ENTITY_DEAD = 0x7D5B1F88E7504BBAULL;
 constexpr uint64_t DOES_ENTITY_EXIST = 0xD42BD6EB2E0F1677ULL;
 constexpr uint64_t GET_MOUNT = 0xE7E11B8DCBED1058ULL;
@@ -352,20 +355,47 @@ bool Russian() {
 }
 const char* Tr(const char* en, const char* ru) { return Russian() ? ru : en; }
 
+// Settling happens while the death screen or a fade may still be up, so notices wait in a queue
+// until the screen is back and the player has control (or kNoticeMaxWaitMs passes).
+constexpr int kNoticeReadyMs = 1500;
+constexpr int kNoticeMaxWaitMs = 90000;
+std::vector<std::string> g_notices;
+int g_noticeSince = 0, g_noticeReadySince = 0;
+
+// The game reads more of both blocks than the two fields filled here: with 32-byte blocks nothing showed on screen
+// (20.11), and in Trail Guide 16-byte blocks made the native throw («Error executing native 0x049D5C615BD38BAD»),
+// so both are zeroed 128-byte buffers as in Frontier Dog: the duration at 0, the text pointer at 8.
+void PostNotice(const std::string& text) {
+  alignas(16) uint64_t duration[16] = {};
+  alignas(16) uint64_t data[16] = {};
+  duration[0] = static_cast<uint32_t>(g_notifyMs);
+  data[1] = reinterpret_cast<uint64_t>(Call<const char*>(VAR_STRING, 10, "LITERAL_STRING", text.c_str()));
+  Call<int>(UI_FEED_POST_HELP_TEXT, duration, data, 1);
+}
+
 void Notify(const std::string& text) {
   Log("notice: %s", text.c_str());
   if (!g_notify) return;
-  const char* s = Call<const char*>(VAR_STRING, 10, "LITERAL_STRING", text.c_str());
-  struct {
-    int64_t duration;
-    int64_t pad[3];
-  } a = {g_notifyMs, {0, 0, 0}};
-  struct {
-    int64_t unk;
-    const char* text;
-    int64_t pad[2];
-  } b = {0, s, {0, 0}};
-  Call<int>(UI_FEED_POST_HELP_TEXT, &a, &b, 1);
+  if (g_notices.empty()) g_noticeSince = Now();
+  g_notices.push_back(text);
+}
+
+void FlushNotices(int p, bool playing, bool dead, bool arrested, int now) {
+  if (g_notices.empty()) return;
+  const bool ready = playing && !dead && !arrested && Call<int>(IS_SCREEN_FADED_IN) != 0 &&
+                     Call<int>(IS_PLAYER_CONTROL_ON, p) != 0 && Call<int>(IS_HUD_HIDDEN) == 0;
+  if (!ready) {
+    g_noticeReadySince = 0;
+    if (now - g_noticeSince < kNoticeMaxWaitMs && now >= g_noticeSince) return;
+    Log("notice: the screen is still not ready after %d ms, shown anyway", now - g_noticeSince);
+  } else {
+    if (!g_noticeReadySince) g_noticeReadySince = now;
+    if (now - g_noticeReadySince < kNoticeReadyMs) return;
+  }
+  for (const auto& text : g_notices) PostNotice(text);
+  Log("notice posted %d ms after it was queued", now - g_noticeSince);
+  g_notices.clear();
+  g_noticeReadySince = 0;
 }
 
 // ------------------------------------------------------------ the logic
@@ -631,6 +661,7 @@ void ScriptMain() {
       ApplyRefund();
       if (g_tableUsable && !g_dryRun) RepairStaleBountyMarks();
     }
+    FlushNotices(p, playing, dead, arrested, now);
     if (dead != wasDead || arrested != wasArrested || playing != wasPlaying) {
       Log("flags: dead=%d arrested=%d playing=%d cash=%d bounty=%d", dead, arrested, playing, Cash(), Bounty(p));
       wasDead = dead;
